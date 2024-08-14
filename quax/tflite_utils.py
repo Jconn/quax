@@ -4,7 +4,12 @@ import numpy as np
 from tflite_schema_py_generated import (Model, SubGraph, Tensor, OperatorCode,
                                         Buffer, Operator, BuiltinOperator, 
                                         BuiltinOptions, FullyConnectedOptions,
-                                        ActivationFunctionType)
+                                        ActivationFunctionType, AddOptions, TensorMap,
+                                        SignatureDef, Metadata, QuantizationParameters)
+
+from enum import Enum
+import jax.numpy as jnp
+_TFLITE_FILE_IDENTIFIER = b'TFL3'
 
 def add_empty_tensor(builder, tensor_name, tensor_dims, buffers):
     #TODO - datatype resolution
@@ -15,6 +20,7 @@ def add_empty_tensor(builder, tensor_name, tensor_dims, buffers):
     tensor_shape = builder.EndVector()
     
 
+    quant = add_empty_quant(builder)
     #create tensor
     Tensor.Start(builder)
     Tensor.AddShape(builder, tensor_shape)
@@ -23,8 +29,40 @@ def add_empty_tensor(builder, tensor_name, tensor_dims, buffers):
     #the 0 buffer is standard notation for empty buffer (e.g. activations)
     Tensor.AddBuffer(builder, 0) 
     Tensor.AddName(builder, tensor_name)
+    Tensor.AddQuantization(builder,quant)
     tensor = Tensor.End(builder)
     return tensor
+
+def add_tensor_with_buffer(builder, tensor_name, np_shape, buffer, buffers):
+    #TODO - datatype resolution
+    tensor_name = builder.CreateString(tensor_name)
+
+    Tensor.StartShapeVector(builder, len(np_shape))
+    #TODO - need to sort out if this really needs reversing - jaxpr standards seem to be backwards
+    for dim in reversed(np_shape):
+        builder.PrependInt32(dim)
+    tensor_shape = builder.EndVector()
+    
+    #TODO - need to deal with empty buffer
+    #add buffer we use here
+    buffer_idx = buffers.index(buffer)
+
+    #create tensor
+    quant = add_empty_quant(builder)
+    Tensor.Start(builder)
+    Tensor.AddShape(builder, tensor_shape)
+    #TODO - conversion from np data to type
+    Tensor.AddType(builder, 0)  # float32
+    Tensor.AddBuffer(builder, buffer_idx) 
+    Tensor.AddName(builder, tensor_name)
+    Tensor.AddQuantization(builder,quant)
+    tensor = Tensor.End(builder)
+    return tensor
+
+def add_empty_quant(builder):
+    QuantizationParameters.QuantizationParametersStart(builder)
+    quantization = QuantizationParameters.QuantizationParametersEnd(builder)
+    return quantization
 
 #tensor add should have a numpy and string as input
 def add_tensor(builder, tensor_name, np_data, buffers):
@@ -47,12 +85,14 @@ def add_tensor(builder, tensor_name, np_data, buffers):
     buffer_idx = buffers.index(buffer)
 
     #create tensor
+    quant = add_empty_quant(builder)
     Tensor.Start(builder)
     Tensor.AddShape(builder, tensor_shape)
     #TODO - conversion from np data to type
     Tensor.AddType(builder, 0)  # float32
     Tensor.AddBuffer(builder, buffer_idx) 
     Tensor.AddName(builder, tensor_name)
+    Tensor.AddQuantization(builder,quant)
     tensor = Tensor.End(builder)
     return tensor
 
@@ -61,20 +101,53 @@ def get_empty_buffer(builder):
     empty_buffer = Buffer.End(builder)
     return empty_buffer
 
-def add_buffer(builder, buffers, data = None):
+def add_string_buffer(builder, buffers, str_data):
+    str_data = builder.CreateString(str_data)
     Buffer.Start(builder)
+    Buffer.AddData(builder, str_data)
+    buffer = Buffer.End(builder)
+    buffers.append(buffer)
+    return buffer
+
+def add_buffer(builder, buffers, data = None):
+    #need to create everything being used in the buffer construction
     if data is not None:
         data_vector = builder.CreateByteVector(np.ravel(data).tobytes())
+    Buffer.Start(builder)
+    if data is not None:
         Buffer.AddData(builder, data_vector)
     buffer = Buffer.End(builder)
     buffers.append(buffer)
     return buffer
 
+def add_add_layer(builder, input_tensor1, input_tensor2, output_tensor, all_tensors):
+    AddOptions.Start(builder)
+    add_options = AddOptions.End(builder)
+    OperatorCode.Start(builder)
+    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().ADD)
+    add_op_code = OperatorCode.End(builder)
+    # Create inputs and outputs
+    add_inputs = create_operator_inputs(builder, [input_tensor1, input_tensor2], all_tensors)
+    add_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
+
+    # Create the Operator
+    Operator.Start(builder)
+    Operator.AddOpcodeIndex(builder, 0)
+    Operator.AddInputs(builder, add_inputs)
+    Operator.AddOutputs(builder, add_outputs)
+    Operator.AddBuiltinOptions(builder, add_options)
+    Operator.AddBuiltinOptionsType(builder, BuiltinOptions.BuiltinOptions().AddOptions)
+    add_op = Operator.End(builder)
+
+    return add_op, add_op_code
+
+
+
 def add_fc_layer(builder, input_tensor, weight_tensor, bias_tensor, output_tensor, all_tensors):
     # Create the FullyConnectedOptions
     FullyConnectedOptions.Start(builder)
     #TODO - need to deal with fusion here - is here a way to do this?
-    FullyConnectedOptions.AddFusedActivationFunction(builder, ActivationFunctionType.ActivationFunctionType().RELU)
+    #FullyConnectedOptions.AddFusedActivationFunction(builder, ActivationFunctionType.ActivationFunctionType().RELU)
     fc_options = FullyConnectedOptions.End(builder)
     # Create the OperatorCode for FullyConnected
     OperatorCode.Start(builder)
@@ -82,6 +155,7 @@ def add_fc_layer(builder, input_tensor, weight_tensor, bias_tensor, output_tenso
     fc_op_code = OperatorCode.End(builder)
     
     #TODO - ordering here is fragile but important
+
     fc_inputs = create_operator_inputs(builder, [input_tensor, weight_tensor, bias_tensor], all_tensors)
     fc_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
 
@@ -94,6 +168,78 @@ def add_fc_layer(builder, input_tensor, weight_tensor, bias_tensor, output_tenso
     fc_op = Operator.End(builder)
     return fc_op, fc_op_code
 
+
+def create_signature_def(builder, input_tensors, output_tensors, all_tensors, subgraph_index):
+    # Create TensorMaps for inputs
+    signature_key = builder.CreateString("serving_default")
+    input_maps = []
+    for tensor in input_tensors:
+        name = "input"
+        name_offset = builder.CreateString(name)
+        TensorMap.TensorMapStart(builder)
+        TensorMap.TensorMapAddName(builder, name_offset)
+        TensorMap.TensorMapAddTensorIndex(builder, all_tensors.index(tensor))
+        input_map = TensorMap.TensorMapEnd(builder)
+        input_maps.append(input_map)
+
+    # Create TensorMaps for outputs
+    output_maps = []
+    for tensor in output_tensors:
+        name = "output"
+        name_offset = builder.CreateString(name)
+        TensorMap.TensorMapStart(builder)
+        TensorMap.TensorMapAddName(builder, name_offset)
+        TensorMap.TensorMapAddTensorIndex(builder, all_tensors.index(tensor))
+        output_map = TensorMap.TensorMapEnd(builder)
+        output_maps.append(output_map)
+
+    # Create vectors of input and output TensorMaps
+
+    SignatureDef.SignatureDefStartInputsVector(builder, len(input_maps))
+    for input_map in reversed(input_maps):
+        builder.PrependUOffsetTRelative(input_map)
+    inputs_vector = builder.EndVector()
+
+    SignatureDef.SignatureDefStartOutputsVector(builder, len(output_maps))
+    for output_map in reversed(output_maps):
+        builder.PrependUOffsetTRelative(output_map)
+    outputs_vector = builder.EndVector()
+
+    # Create the SignatureDef
+    SignatureDef.SignatureDefStart(builder)
+    SignatureDef.AddSignatureKey(builder, signature_key)
+    SignatureDef.AddSubgraphIndex(builder, subgraph_index)
+    SignatureDef.SignatureDefAddInputs(builder, inputs_vector)
+    SignatureDef.SignatureDefAddOutputs(builder, outputs_vector)
+    signature_def = SignatureDef.SignatureDefEnd(builder)
+
+    return signature_def
+
+def create_runtime_metadata(builder, buffers):
+    #TODO - what metadata is there
+    buffer = add_string_buffer(builder, buffers, "1.5.0")
+
+    name = builder.CreateString("min_runtime_version")
+    
+    Metadata.Start(builder)
+    Metadata.AddName(builder, name)
+    Metadata.AddBuffer(builder, buffers.index(buffer))
+    metadata = Metadata.End(builder)
+    return metadata
+
+def create_conversion_metadata(builder, buffers):
+    #TODO - what metadata is there
+
+
+    name = builder.CreateString("CONVERSION_METADATA")
+    buffer = add_buffer(builder, buffers, jnp.array(len(buffers)-1))
+    
+    Metadata.Start(builder)
+    Metadata.AddName(builder, name)
+    Metadata.AddBuffer(builder, buffers.index(buffer))
+    metadata = Metadata.End(builder)
+    return metadata
+
 def create_subgraph_tensors(builder, tensors):
     SubGraph.StartTensorsVector(builder, len(tensors))
     for tensor in reversed(tensors):
@@ -104,7 +250,10 @@ def create_subgraph_tensors(builder, tensors):
 def create_operator_inputs(builder, input_tensors, all_tensors):
     Operator.StartInputsVector(builder, len(input_tensors))
     for itensor in reversed(input_tensors):
-        builder.PrependInt32(all_tensors.index(itensor))  # input tensor index
+        if itensor not in all_tensors:
+            builder.PrependInt32(-1) #if the target tensor doesn't exist, append -1 
+        else:
+            builder.PrependInt32(all_tensors.index(itensor))  # input tensor index
     subgraph_inputs = builder.EndVector()
     return subgraph_inputs
 
@@ -137,15 +286,17 @@ def create_subgraph_ops(builder, ops):
     subgraph_ops = builder.EndVector()
     return subgraph_ops
 
-def create_subgraph(builder, subgraph_tensors, subgraph_inputs, subgraph_outputs, subgraph_ops):
+def create_subgraph(builder, subgraph_tensors, subgraph_inputs, subgraph_outputs, subgraph_ops, subgraph_name):
 
     #formalize builder constructs from python lists
+    subgraph_name = builder.CreateString(subgraph_name)
     subgraph_inputs = create_subgraph_inputs(builder, subgraph_inputs, subgraph_tensors)
     subgraph_outputs = create_subgraph_outputs(builder, subgraph_outputs, subgraph_tensors)
     subgraph_tensors = create_subgraph_tensors(builder, subgraph_tensors)
     subgraph_ops = create_subgraph_ops(builder, subgraph_ops)
 
     SubGraph.Start(builder)
+    SubGraph.AddName(builder, subgraph_name)
     SubGraph.AddTensors(builder, subgraph_tensors)
     SubGraph.AddInputs(builder, subgraph_inputs)
     SubGraph.AddOutputs(builder, subgraph_outputs)
@@ -159,6 +310,20 @@ def create_model_subgraphs(builder, subgraphs):
         builder.PrependUOffsetTRelative(subgraph)
     subgraphs = builder.EndVector()
     return subgraphs
+
+def create_metadatas(builder, metadatas):
+    Model.StartMetadataVector(builder, len(metadatas) )
+    for metadata in reversed(metadatas):
+        builder.PrependUOffsetTRelative(metadata)
+    metadatas = builder.EndVector()
+    return metadatas
+
+def create_signature_defs(builder, signature_defs):
+    Model.StartSignatureDefsVector(builder, len(signature_defs) )
+    for sig_def in reversed(signature_defs):
+        builder.PrependUOffsetTRelative(sig_def)
+    sig_defs = builder.EndVector()
+    return sig_defs
 
 def create_opcodes(builder, op_codes):
     Model.StartOperatorCodesVector(builder, len(op_codes))
@@ -174,20 +339,106 @@ def create_buffers(builder, buffers):
     buffers = builder.EndVector()
     return buffers
 
-def create_model(builder, subgraphs, op_codes, buffers):
+def create_model(builder, subgraphs, op_codes, buffers, signature_defs, metadatas):
+    metadatas = create_metadatas(builder, metadatas)
+    signature_defs = create_signature_defs(builder, signature_defs)
     subgraphs = create_model_subgraphs(builder, subgraphs)
     op_codes = create_opcodes(builder, op_codes)
     buffers = create_buffers(builder, buffers)
+    description = builder.CreateString("Quax Converted.")
+    #description = builder.CreateString("MLIR Converted.")
 
     Model.Start(builder)
+    Model.AddDescription(builder, description)
     Model.AddVersion(builder, 3)
     Model.AddSubgraphs(builder, subgraphs)
     Model.AddOperatorCodes(builder, op_codes)
     Model.AddBuffers(builder, buffers)
+    Model.AddSignatureDefs(builder, signature_defs)
+    Model.AddMetadata(builder, metadatas)
     model = Model.End(builder)
     return model
 
 def export_tflite(builder, model):
-    builder.Finish(model)
+    builder.Finish(model, file_identifier=_TFLITE_FILE_IDENTIFIER)
     tflite_model_data = builder.Output()
     return tflite_model_data
+
+
+
+def map_jax_to_tflite_op(jax_primitive):
+    jax_op_name = jax_primitive.name
+    
+    # Direct mappings
+    direct_map = {
+        'add': BuiltinOperator.ADD,
+        'sub': BuiltinOperator.SUB,
+        'mul': BuiltinOperator.MUL,
+        'div': BuiltinOperator.DIV,
+        'reduce_sum': BuiltinOperator.SUM,
+        'reduce_max': BuiltinOperator.REDUCE_MAX,
+        'reduce_min': BuiltinOperator.REDUCE_MIN,
+        'reshape': BuiltinOperator.RESHAPE,
+        'transpose': BuiltinOperator.TRANSPOSE,
+        'slice': BuiltinOperator.SLICE,
+        'concatenate': BuiltinOperator.CONCATENATION,
+        'sin': BuiltinOperator.SIN,
+        'cos': BuiltinOperator.COS,
+        'tanh': BuiltinOperator.TANH,
+        'exp': BuiltinOperator.EXP,
+        'log': BuiltinOperator.LOG,
+        'pow': BuiltinOperator.POW,
+        'sqrt': BuiltinOperator.SQRT,
+        'rsqrt': BuiltinOperator.RSQRT,
+        'abs': BuiltinOperator.ABS,
+        'neg': BuiltinOperator.NEG,
+        'sign': BuiltinOperator.SIGN,
+        'floor': BuiltinOperator.FLOOR,
+        'ceil': BuiltinOperator.CEIL,
+        'round': BuiltinOperator.ROUND,
+        'squeeze': BuiltinOperator.SQUEEZE,
+        'cast': BuiltinOperator.CAST,
+    }
+    
+    if jax_op_name in direct_map:
+        return direct_map[jax_op_name]
+    
+    # Special cases
+    if jax_op_name == 'dot_general':
+        # Note: This might need to be CONV_2D in some cases
+        return BuiltinOperator.FULLY_CONNECTED
+    elif jax_op_name == 'conv_general_dilated':
+        return BuiltinOperator.CONV_2D
+    elif jax_op_name == 'max_pool':
+        return BuiltinOperator.MAX_POOL_2D
+    elif jax_op_name == 'avg_pool':
+        return BuiltinOperator.AVERAGE_POOL_2D
+    elif jax_op_name == 'nn.relu':
+        return BuiltinOperator.RELU
+    elif jax_op_name == 'nn.sigmoid':
+        return BuiltinOperator.LOGISTIC
+    elif jax_op_name == 'nn.softmax':
+        return BuiltinOperator.SOFTMAX
+    elif jax_op_name == 'broadcast_in_dim':
+        return BuiltinOperator.BROADCAST_TO
+    elif jax_op_name == 'select':
+        return BuiltinOperator.SELECT
+    elif jax_op_name == 'gather':
+        return BuiltinOperator.GATHER
+    elif jax_op_name == 'dynamic_slice':
+        return BuiltinOperator.SLICE  # Note: May need additional processing
+    elif jax_op_name == 'dynamic_update_slice':
+        return BuiltinOperator.DYNAMIC_UPDATE_SLICE
+    elif jax_op_name == 'conv_transpose':
+        return BuiltinOperator.TRANSPOSE_CONV
+    elif jax_op_name == 'erf':
+        # TFLite doesn't have a direct ERF op, might need to be approximated
+        raise NotImplementedError("ERF operation not directly supported in TFLite")
+    
+    # If no mapping is found
+    raise ValueError(f"Unsupported JAX primitive: {jax_op_name}")
+
+# Usage:
+# jax_primitive = ... # Your JAX primitive
+# tflite_op = map_jax_to_tflite_op(jax_primitive)
+# print(f"JAX primitive {jax_primitive.name} maps to TFLite op {tflite_op.name}")
