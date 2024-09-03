@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from quax.jax2tflite import FBB
-from quax.quax import QDense, Quantize
+from quax.quax import QDense, Quantize, id_gen
 import tensorflow as tf
 from jax import core
 from aqt.jax.v2 import config as aqt_config
@@ -42,6 +42,7 @@ if __name__ == "__main__":
         aqt_cfg: aqt_config.DotGeneral
         @nn.compact
         def __call__(self, x):
+            id_gen.reset()
             x = Quantize(aqt_cfg = self.aqt_cfg, calibration_axes=-1)(x)
             x = QDense(features=10, aqt_cfg= self.aqt_cfg)(x)
             if self.aqt_cfg: 

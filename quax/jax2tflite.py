@@ -17,6 +17,31 @@ import logging
 from quax.quax import Operation
 import numpy as np
 
+def bits_to_type(bits):
+    if bits <= 8:
+        dtype = np.int8
+    elif bits <= 16:
+        dtype = np.int16
+    elif bits <= 32:
+        dtype = np.int32
+    elif bits <= 64:
+        dtype = np.int64
+    return dtype
+
+def find_path(tree, graph_id):
+    flat_tree = jax.tree_util.tree_flatten_with_path(tree)[0]
+    root_path = None
+    for route in flat_tree:
+        path = route[0]
+        path_id = route[1]
+        if graph_id == path_id:
+            root_path = path[:-2]
+            break
+            #we found our section, now we extract the path 
+            #shave off the last two pieces of the graph
+    #we found the root path
+    return root_path
+
 #converts a jax model to a flatbuffer 
 class FBB:
     def __init__(self):
@@ -35,6 +60,7 @@ class FBB:
         self.handlers['custom_jvp_call'] = self.custom_jvp_handler
         self.handlers['tanh'] = self.tanh_handler
         self.handlers[Operation.FC.value] = self.fc_handler
+        self.handlers[Operation.QUANTIZE.value] = self.quant_handler
 
 
 
@@ -106,6 +132,29 @@ class FBB:
         else:
             self.eqn_handler(eqn[0].primitive.name)
 
+    def quant_handler(self, eqns):
+        graph_id = eqns[0].params['graph_id']
+        marker_eqn = eqns.pop(0)
+        root_path = find_path(self.model_params['quax'], graph_id)
+
+        weight_path = self.model_params['aqt']
+        quax_path = self.model_params['quax']
+        #traverse the tree
+        for segment in root_path:
+            weight_path = weight_path[segment.key]
+            quax_path = quax_path[segment.key]
+        quant_var = marker_eqn.invars[0]
+        out_bits = quax_path['bits'][0]['out']
+        out_dtype = bits_to_type(out_bits) 
+        out_quantize = weight_path['output']  
+        out_scale = out_quantize.scale[0]
+        out_zp = jnp.zeros(out_scale.shape, dtype=np.int32)
+        out_qparams = add_quantization_params(self.builder, None, None, out_scale, out_zp, quantized_dim = 0)
+        out_tensor = add_empty_tensor(self.builder, "activation", quant_var.aval.shape, self.buffers, quantization_params = out_qparams, dtype = out_dtype)
+        self.record_activation(quant_var, out_tensor)
+        #TODO - add quant op
+
+
     def fc_handler(self, eqns):
         '''
         structure of fc ops should be
@@ -141,31 +190,12 @@ class FBB:
             activation_eqn = None
         assert len(eqns) == 1 
 
-        flat_tree = jax.tree_util.tree_flatten_with_path(self.model_params['quax'])[0]
-        root_path = None
-        for route in flat_tree:
-            path = route[0]
-            path_id = route[1]
-            if graph_id == path_id:
-                root_path = path[:-2]
-                break
-                #we found our section, now we extract the path 
-                #shave off the last two pieces of the graph
-        #we found the root path
+        root_path = find_path(self.model_params['quax'], graph_id)
+
         assert root_path, "didn't find path for this now what"
         weight_path = self.model_params['aqt']
         quax_path = self.model_params['quax']
         #traverse the tree
-        def bits_to_type(bits):
-            if bits <= 8:
-                dtype = np.int8
-            elif bits <= 16:
-                dtype = np.int16
-            elif bits <= 32:
-                dtype = np.int32
-            elif bits <= 64:
-                dtype = np.int64
-            return dtype
         for segment in root_path:
             weight_path = weight_path[segment.key]
             quax_path = quax_path[segment.key]
@@ -177,7 +207,6 @@ class FBB:
         activation_dtype = bits_to_type(activation_bits) 
         weight_dtype = bits_to_type(weight_bits) 
         out_dtype = bits_to_type(out_bits) 
-
         bias_dtype = bits_to_type(weight_bits + activation_bits + 16)
 
         #now we have our tensors 
@@ -227,9 +256,8 @@ class FBB:
         #record the output tensor
 
         #TODO deal with possible fused activation
-        import pdb; pdb.set_trace()
         out_scale = in_quantize['frozen'].scale[0]
-        zero_point = jnp.zeros(act_scale.shape, dtype=np.int32)
+        zero_point = jnp.zeros(out_scale.shape, dtype=np.int32)
         out_qparams = add_quantization_params(self.builder, None, None, out_scale, zero_point, quantized_dim = 0)
         out_tensor = add_empty_tensor(self.builder, "activation", out_var.aval.shape, self.buffers, quantization_params = out_qparams,dtype=out_dtype)
 

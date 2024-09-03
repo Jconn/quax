@@ -27,6 +27,7 @@ from flax.typing import (
 class Operation(Enum):
     UNKNOWN = 0 
     FC = 1
+    QUANTIZE = 2
 
 class MID:
     def __init__(self):
@@ -94,15 +95,32 @@ q.init_calibration()
 class Quantize(nn.Module):
     aqt_cfg: aqt_config.DotGeneral
     calibration_axes: int
+    op_type: Operation = Operation.QUANTIZE
+
     @nn.compact
     def __call__(self, x):
-        if self.aqt_cfg == None:
-            return x
-        qx,_ =  q.quant(x, calibration_axes = self.calibration_axes)
 
-        def initializer():
-          return qx.without_qvalue() 
-        self.variable('aqt', 'frozen', initializer)
+        marker_id = id_gen.next()
+        self.sow('quax', 'start',marker_id)
+        self.sow('quax', 'bits', {'out': 8})
+        #TODO - quantized tensor in handling
+        #if self.aqt_cfg:
+        #    tmp = marker_prim(x, marker_id, self.op_type.value)
+        #else:
+        #    tmp = marker_prim(x, marker_id, self.op_type.value)
+        tmp = marker_prim(x, marker_id, self.op_type.value)
+
+        if self.aqt_cfg == None:
+            qx = x
+        else:
+            qx,_ =  q.quant(x, calibration_axes = self.calibration_axes)
+
+            def initializer():
+              return qx.without_qvalue() 
+
+            self.variable('aqt', 'output', initializer)
+        tmp = marker_prim(x, marker_id, self.op_type.value)
+        self.sow('quax', 'end', marker_id)
         return qx
 
 class QDense(nn.Module):
@@ -117,7 +135,6 @@ class QDense(nn.Module):
     @nn.compact
     def __call__(self, x):
         #TODO - assignment means here
-        id_gen.reset()
         marker_id = id_gen.next()
         #x = x.dequant()
         self.sow('quax', 'start',marker_id)
