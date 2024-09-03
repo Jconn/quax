@@ -5,13 +5,24 @@ from tflite_schema_py_generated import (Model, SubGraph, Tensor, OperatorCode,
                                         Buffer, Operator, BuiltinOperator, 
                                         BuiltinOptions, FullyConnectedOptions,
                                         ActivationFunctionType, AddOptions, TensorMap,
-                                        SignatureDef, Metadata, QuantizationParameters)
+                                        SignatureDef, Metadata, QuantizationParameters, ReshapeOptions, TensorType)
 
 from enum import Enum
 import jax.numpy as jnp
+import numpy as np
 _TFLITE_FILE_IDENTIFIER = b'TFL3'
 
-def add_empty_tensor(builder, tensor_name, tensor_dims, buffers):
+def map_tensor_type(dtype):
+    dtype_map = {}
+    dtype_map[np.float32] = TensorType.TensorType.FLOAT32
+    dtype_map[np.int32] = TensorType.TensorType.INT32
+    dtype_map[np.int8] = TensorType.TensorType.INT8
+    dtype_map[np.int16] = TensorType.TensorType.INT16
+    return dtype_map[dtype]
+
+
+
+def add_empty_tensor(builder, tensor_name, tensor_dims, buffers, quantization_params = None, dtype = np.float32):
     #TODO - datatype resolution
     tensor_name = builder.CreateString(tensor_name)
     Tensor.StartShapeVector(builder, len(tensor_dims))
@@ -19,21 +30,51 @@ def add_empty_tensor(builder, tensor_name, tensor_dims, buffers):
         builder.PrependInt32(dim)
     tensor_shape = builder.EndVector()
     
-
-    quant = add_empty_quant(builder)
+    if quantization_params is None:
+        quantization_params = add_empty_quant(builder)
     #create tensor
     Tensor.Start(builder)
     Tensor.AddShape(builder, tensor_shape)
-    #TODO - conversion from np data to type
-    Tensor.AddType(builder, 0)  # float32
+    Tensor.AddType(builder, map_tensor_type(dtype) ) 
     #the 0 buffer is standard notation for empty buffer (e.g. activations)
     Tensor.AddBuffer(builder, 0) 
     Tensor.AddName(builder, tensor_name)
-    Tensor.AddQuantization(builder,quant)
+    Tensor.AddQuantization(builder,quantization_params)
     tensor = Tensor.End(builder)
     return tensor
 
-def add_tensor_with_buffer(builder, tensor_name, np_shape, buffer, buffers):
+def add_quantization_params(builder, mins, maxs, scale, zero_point, quantized_dim):
+    #convert all the vectors
+    def to_vec(x):
+        if x is not None:
+            x= np.array(x)
+            return builder.CreateNumpyVector(np.ravel(x) )
+        return None
+    zero_point = np.array(zero_point, dtype=np.int64)
+    print(f"{scale.shape}, {zero_point.shape}")
+    mins = to_vec(mins) 
+    maxs = to_vec(maxs)
+    scale = to_vec(scale) 
+    zero_point = to_vec(zero_point)
+    #builder.CreateByteVector(np.ravel(np.array(zero_point, dtype=np.int16)).tobytes())
+
+    QuantizationParameters.Start(builder)
+    if mins is not None:
+        QuantizationParameters.AddMin(builder, mins)
+    if maxs is not None:
+        QuantizationParameters.AddMax(builder, maxs)
+
+    QuantizationParameters.AddScale(builder, scale)
+    QuantizationParameters.AddZeroPoint(builder, zero_point)
+    QuantizationParameters.AddQuantizedDimension(builder, quantized_dim)
+    QuantizationParameters.AddDetailsType(builder, 0)
+    qparams = QuantizationParameters.End(builder)
+    return qparams
+
+
+
+
+def add_tensor_with_buffer(builder, tensor_name, np_shape, buffer, buffers, dtype = np.float32):
     #TODO - datatype resolution
     tensor_name = builder.CreateString(tensor_name)
 
@@ -51,8 +92,7 @@ def add_tensor_with_buffer(builder, tensor_name, np_shape, buffer, buffers):
     quant = add_empty_quant(builder)
     Tensor.Start(builder)
     Tensor.AddShape(builder, tensor_shape)
-    #TODO - conversion from np data to type
-    Tensor.AddType(builder, 0)  # float32
+    Tensor.AddType(builder, map_tensor_type(dtype) ) 
     Tensor.AddBuffer(builder, buffer_idx) 
     Tensor.AddName(builder, tensor_name)
     Tensor.AddQuantization(builder,quant)
@@ -65,7 +105,7 @@ def add_empty_quant(builder):
     return quantization
 
 #tensor add should have a numpy and string as input
-def add_tensor(builder, tensor_name, np_data, buffers):
+def add_tensor(builder, tensor_name, np_data, buffers, quantization_params = None, dtype = np.float32):
     #TODO - datatype resolution
     np_shape = np_data.shape
     tensor_name = builder.CreateString(tensor_name)
@@ -77,6 +117,7 @@ def add_tensor(builder, tensor_name, np_data, buffers):
     
     #TODO - need to deal with empty buffer
     #add buffer we use here
+    print(np_data.dtype)
     data_vector = builder.CreateByteVector(np.ravel(np_data).tobytes())
     Buffer.Start(builder)
     Buffer.AddData(builder, data_vector)
@@ -85,14 +126,15 @@ def add_tensor(builder, tensor_name, np_data, buffers):
     buffer_idx = buffers.index(buffer)
 
     #create tensor
-    quant = add_empty_quant(builder)
+    if quantization_params is None:
+        quantization_params = add_empty_quant(builder)
+
     Tensor.Start(builder)
     Tensor.AddShape(builder, tensor_shape)
-    #TODO - conversion from np data to type
-    Tensor.AddType(builder, 0)  # float32
+    Tensor.AddType(builder, map_tensor_type(dtype) ) 
     Tensor.AddBuffer(builder, buffer_idx) 
     Tensor.AddName(builder, tensor_name)
-    Tensor.AddQuantization(builder,quant)
+    Tensor.AddQuantization(builder,quantization_params)
     tensor = Tensor.End(builder)
     return tensor
 
@@ -120,39 +162,107 @@ def add_buffer(builder, buffers, data = None):
     buffers.append(buffer)
     return buffer
 
-def add_add_layer(builder, input_tensor1, input_tensor2, output_tensor, all_tensors):
+def add_operator(builder, inputs, outputs, options,options_type, opcode, all_opcodes):
+    if opcode not in all_opcodes:
+        all_opcodes.append(opcode)
+
+    Operator.Start(builder)
+    Operator.AddOpcodeIndex(builder, all_opcodes.index(opcode))
+    Operator.AddInputs(builder, inputs)
+    Operator.AddOutputs(builder, outputs)
+    if options:
+        Operator.AddBuiltinOptions(builder, options)
+    if options_type:
+        Operator.AddBuiltinOptionsType(builder, options_type)
+    op = Operator.End(builder)
+    return op
+
+def add_add_layer(builder, input_tensor1, input_tensor2, output_tensor, all_tensors, all_opcodes):
     AddOptions.Start(builder)
     add_options = AddOptions.End(builder)
     OperatorCode.Start(builder)
     OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().ADD)
-    add_op_code = OperatorCode.End(builder)
+    add_opcode = OperatorCode.End(builder)
     # Create inputs and outputs
     add_inputs = create_operator_inputs(builder, [input_tensor1, input_tensor2], all_tensors)
     add_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
 
-    # Create the Operator
-    Operator.Start(builder)
-    Operator.AddOpcodeIndex(builder, 0)
-    Operator.AddInputs(builder, add_inputs)
-    Operator.AddOutputs(builder, add_outputs)
-    Operator.AddBuiltinOptions(builder, add_options)
-    Operator.AddBuiltinOptionsType(builder, BuiltinOptions.BuiltinOptions().AddOptions)
-    add_op = Operator.End(builder)
+    add_op = add_operator(builder, add_inputs, add_outputs, add_options, BuiltinOptions.BuiltinOptions().AddOptions, add_opcode, all_opcodes)
+    return add_op
 
-    return add_op, add_op_code
+def add_activation_layer(builder, activation_name, input_tensor, output_tensor, all_tensors, all_opcodes):
+    # Create the ActivationFunctionType for ReLU
+
+    # Create the OperatorCode for ReLU
+    activation_map = {}
+    activation_map['relu'] = BuiltinOperator.BuiltinOperator().RELU
+    activation_map['tanh'] = BuiltinOperator.BuiltinOperator().TANH
+    activation_map['sigmoid'] = BuiltinOperator.BuiltinOperator().LOGISTIC
 
 
+    OperatorCode.Start(builder)
 
-def add_fc_layer(builder, input_tensor, weight_tensor, bias_tensor, output_tensor, all_tensors):
+
+    OperatorCode.AddBuiltinCode(builder, activation_map[activation_name])
+    act_fn_opcode = OperatorCode.End(builder)
+    
+    # Create inputs and outputs
+    act_fn_inputs = create_operator_inputs(builder, [input_tensor], all_tensors)
+    act_fn_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
+
+    act_fn_op = add_operator(builder, act_fn_inputs, act_fn_outputs, None, None, act_fn_opcode, all_opcodes)
+
+    return act_fn_op
+
+def add_relu_layer(builder, input_tensor, output_tensor, all_tensors, all_opcodes):
+    # Create the ActivationFunctionType for ReLU
+
+    # Create the OperatorCode for ReLU
+    OperatorCode.Start(builder)
+    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().RELU)
+    relu_opcode = OperatorCode.End(builder)
+    
+    # Create inputs and outputs
+    relu_inputs = create_operator_inputs(builder, [input_tensor], all_tensors)
+    relu_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
+
+    relu_op = add_operator(builder, relu_inputs, relu_outputs, None, None, relu_opcode, all_opcodes)
+    return relu_op
+
+def add_reshape_layer(builder, input_tensor, output_tensor, new_shape, all_tensors, all_opcodes):
+    # Create the ReshapeOptions
+    ReshapeOptions.StartNewShapeVector(builder, len(new_shape))
+    for dim in reversed(new_shape):
+        builder.PrependInt32(dim)
+    new_shape_vector = builder.EndVector()
+
+    ReshapeOptions.ReshapeOptionsStart(builder)
+    ReshapeOptions.ReshapeOptionsAddNewShape(builder, new_shape_vector)
+    reshape_options = ReshapeOptions.ReshapeOptionsEnd(builder)
+
+    # Create the OperatorCode for Reshape
+    OperatorCode.Start(builder)
+    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().RESHAPE)
+    reshape_opcode = OperatorCode.End(builder)
+    
+    # Create inputs and outputs
+    reshape_inputs = create_operator_inputs(builder, [input_tensor], all_tensors)
+    reshape_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
+
+    reshape_op = add_operator(builder, reshape_inputs, reshape_outputs, reshape_options, BuiltinOptions.BuiltinOptions().ReshapeOptions, reshape_opcode, all_opcodes)
+    return reshape_op
+
+def add_fc_layer(builder, input_tensor, weight_tensor, bias_tensor, output_tensor,bias_dtype, all_tensors, all_opcodes):
     # Create the FullyConnectedOptions
     FullyConnectedOptions.Start(builder)
     #TODO - need to deal with fusion here - is here a way to do this?
     #FullyConnectedOptions.AddFusedActivationFunction(builder, ActivationFunctionType.ActivationFunctionType().RELU)
+    FullyConnectedOptions.AddQuantizedBiasType(builder, map_tensor_type(bias_dtype))
     fc_options = FullyConnectedOptions.End(builder)
     # Create the OperatorCode for FullyConnected
     OperatorCode.Start(builder)
     OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().FULLY_CONNECTED)
-    fc_op_code = OperatorCode.End(builder)
+    fc_opcode = OperatorCode.End(builder)
     
     #TODO - ordering here is fragile but important
 
@@ -166,7 +276,9 @@ def add_fc_layer(builder, input_tensor, weight_tensor, bias_tensor, output_tenso
     Operator.AddBuiltinOptions(builder, fc_options)
     Operator.AddBuiltinOptionsType(builder, BuiltinOptions.BuiltinOptions().FullyConnectedOptions)
     fc_op = Operator.End(builder)
-    return fc_op, fc_op_code
+
+    fc_op = add_operator(builder, fc_inputs, fc_outputs, fc_options, BuiltinOptions.BuiltinOptions().FullyConnectedOptions, fc_opcode, all_opcodes)
+    return fc_op
 
 
 def create_signature_def(builder, input_tensors, output_tensors, all_tensors, subgraph_index):
