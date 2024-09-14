@@ -5,12 +5,28 @@ from tflite_schema_py_generated import (Model, SubGraph, Tensor, OperatorCode,
                                         Buffer, Operator, BuiltinOperator, 
                                         BuiltinOptions, FullyConnectedOptions,
                                         ActivationFunctionType, AddOptions, TensorMap,
-                                        SignatureDef, Metadata, QuantizationParameters, ReshapeOptions, TensorType)
+                                        SignatureDef, Metadata, QuantizationParameters, ReshapeOptions, TensorType, Conv2DOptions,ActivationFunctionType)
 
 from enum import Enum
 import jax.numpy as jnp
 import numpy as np
 _TFLITE_FILE_IDENTIFIER = b'TFL3'
+
+def map_activation_eqn(activation_eqn):
+    if activation_eqn == None:
+        return ActivationFunctionType.ActivationFunctionType.NONE
+    act_map= {}
+    act_map['relu'] = ActivationFunctionType.ActivationFunctionType.RELU
+    act_map['tanh'] = ActivationFunctionType.ActivationFunctionType.TANH
+    #TODO - fix this stuff up
+    if 'call_jaxpr' in activation_eqn.params.keys():
+        act_name = activation_eqn.params['call_jaxpr'].jaxpr.eqns[0].params['name']
+    else:
+        act_name = activation_eqn.primitive.name
+    if act_name in act_map.keys():
+        return act_map[act_name]
+    raise Exception(f"could not map activation {act_name}")
+    return None
 
 def map_tensor_type(dtype):
     dtype_map = {}
@@ -18,6 +34,7 @@ def map_tensor_type(dtype):
     dtype_map[np.int32] = TensorType.TensorType.INT32
     dtype_map[np.int8] = TensorType.TensorType.INT8
     dtype_map[np.int16] = TensorType.TensorType.INT16
+    dtype_map[np.int64] = TensorType.TensorType.INT64
     return dtype_map[dtype]
 
 
@@ -252,12 +269,50 @@ def add_reshape_layer(builder, input_tensor, output_tensor, new_shape, all_tenso
     reshape_op = add_operator(builder, reshape_inputs, reshape_outputs, reshape_options, BuiltinOptions.BuiltinOptions().ReshapeOptions, reshape_opcode, all_opcodes)
     return reshape_op
 
-def add_fc_layer(builder, input_tensor, weight_tensor, bias_tensor, output_tensor,bias_dtype, all_tensors, all_opcodes):
+def add_conv_layer(builder, input_tensor, weight_tensor, bias_tensor, output_tensor,bias_dtype, all_tensors, all_opcodes):
+    Conv2DOptions.Start(builder)
+    #TODO - need to deal with fusion here - is here a way to do this?
+    Conv2DOptions.AddQuantizedBiasType(builder, map_tensor_type(bias_dtype))
+    #TODO - conv stride options
+    Conv2DOptions.AddStrideH(builder, 1)
+    Conv2DOptions.AddStrideW(builder, 1)
+    conv_options = Conv2DOptions.End(builder)
+    OperatorCode.Start(builder)
+    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().CONV_2D)
+    conv_opcode = OperatorCode.End(builder)
+    
+    #TODO - ordering here is fragile but important
+
+    conv_inputs = create_operator_inputs(builder, [input_tensor, weight_tensor, bias_tensor], all_tensors)
+    conv_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
+
+    Operator.Start(builder)
+    Operator.AddOpcodeIndex(builder, 0)
+    Operator.AddInputs(builder, conv_inputs)
+    Operator.AddOutputs(builder, conv_outputs)
+    Operator.AddBuiltinOptions(builder, conv_options)
+    Operator.AddBuiltinOptionsType(builder, BuiltinOptions.BuiltinOptions().FullyConnectedOptions)
+    conv_op = Operator.End(builder)
+
+    conv_op = add_operator(builder, conv_inputs, conv_outputs, conv_options, BuiltinOptions.BuiltinOptions().Conv2DOptions, conv_opcode, all_opcodes)
+    return conv_op
+
+def add_activation_layer(builder, input_tensor, output_tensor,operator_type, all_tensors, all_opcodes):
+    OperatorCode.Start(builder)
+    OperatorCode.AddBuiltinCode(builder, operator_type)
+    act_opcode = OperatorCode.End(builder)
+    act_inputs = create_operator_inputs(builder, [input_tensor], all_tensors)
+    act_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
+    act_op = add_operator(builder, act_inputs, act_outputs, None, None, act_opcode, all_opcodes)
+    return act_op
+
+def add_fc_layer(builder, input_tensor, weight_tensor, bias_tensor, output_tensor,bias_dtype,activation_op, all_tensors, all_opcodes):
     # Create the FullyConnectedOptions
     FullyConnectedOptions.Start(builder)
     #TODO - need to deal with fusion here - is here a way to do this?
     #FullyConnectedOptions.AddFusedActivationFunction(builder, ActivationFunctionType.ActivationFunctionType().RELU)
     FullyConnectedOptions.AddQuantizedBiasType(builder, map_tensor_type(bias_dtype))
+    FullyConnectedOptions.AddFusedActivationFunction(builder,activation_op)
     fc_options = FullyConnectedOptions.End(builder)
     # Create the OperatorCode for FullyConnected
     OperatorCode.Start(builder)
