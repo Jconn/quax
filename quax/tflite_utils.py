@@ -10,23 +10,16 @@ from tflite_schema_py_generated import (Model, SubGraph, Tensor, OperatorCode,
 from enum import Enum
 import jax.numpy as jnp
 import numpy as np
+from quax.quax import AppendedActivation
 _TFLITE_FILE_IDENTIFIER = b'TFL3'
 
-def map_activation_eqn(activation_eqn):
-    if activation_eqn == None:
+def map_appended_activation(appended_activation):
+    if appended_activation == None:
         return ActivationFunctionType.ActivationFunctionType.NONE
     act_map= {}
-    act_map['relu'] = ActivationFunctionType.ActivationFunctionType.RELU
-    act_map['tanh'] = ActivationFunctionType.ActivationFunctionType.TANH
-    #TODO - fix this stuff up
-    if 'call_jaxpr' in activation_eqn.params.keys():
-        act_name = activation_eqn.params['call_jaxpr'].jaxpr.eqns[0].params['name']
-    else:
-        act_name = activation_eqn.primitive.name
-    if act_name in act_map.keys():
-        return act_map[act_name]
-    raise Exception(f"could not map activation {act_name}")
-    return None
+    act_map[AppendedActivation.RELU] = ActivationFunctionType.ActivationFunctionType.RELU
+    act_map[AppendedActivation.RELU6] = ActivationFunctionType.ActivationFunctionType.TANH
+    return act_map[appended_activation] 
 
 def map_tensor_type(dtype):
     dtype_map = {}

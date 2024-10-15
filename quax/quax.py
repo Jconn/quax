@@ -12,11 +12,14 @@ from flax.linen import initializers
 from aqt.jax.v2 import config as aqt_config
 from jax import eval_shape, lax
 from enum import Enum
-from quax.quax_config import OpConfig
+from quax.quax_config import OpConfig, quantizer
+from quax.quaxpr import quaxpr_prim, Operation, pytree_fc, quaxpr_default, quaxpr_functional, quaxpr_unquant_prim, AppendedActivation
 import numpy as np
 from jax.core import ShapedArray
 from flax.linen.dtypes import promote_dtype
 from aqt.jax.v2.aqt_tensor import QTensor
+from jax.interpreters import ad
+from aqt.jax.v2 import aqt_tensor
 
 from flax.typing import (
   Any,
@@ -33,13 +36,7 @@ from flax.typing import (
   Sequence
 )
 
-class Operation(Enum):
-    UNKNOWN = 0 
-    FC = 1
-    QUANTIZE = 2
-    CONV = 3 
-    TANH = 4
-    ACTIVATION = 5
+
 
 class MID:
     def __init__(self):
@@ -66,6 +63,14 @@ def marker_abstract_eval(xs, graph_id, op_id):
 
 marker_p.def_impl(marker_impl)
 marker_p.def_abstract_eval(marker_abstract_eval)
+# Define the JVP rule for differentiation
+def marker_jvp(primals, tangents, **params):
+    x = primals
+    t_x = tangents
+    y = marker_p.bind(x, **params)
+    return y, t_x
+
+ad.defjvp(marker_p, marker_jvp)
 
 
 class Quantize(nn.Module):
@@ -75,19 +80,40 @@ class Quantize(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        marker_id = id_gen.next()
-        marker_prim(x, marker_id, self.op_type.value)
-        cfg = OpConfig(self.bits,self.bits, enabled = self.quantized)
+        quax_pytree = {}
+        quax_pytree['op'] = self.op_type
+        quaxpr_unquant_prim(x, quax_pytree)
+        #this is unquantized, so we can't use the default quaxpr gen here
+        out_quantizer = quantizer(self.bits, po2_scaling = False)
+       
 
-        self.sow('quax', 'start',marker_id)
-        self.sow('quax', 'bits', {'out': self.bits})
-        #calibration axes specify which axes you should calibrate over
-        #TODO seems like any activation quantization should be across every axis 
-        #but not positive
-        x = cfg.quantize(self, x, calibration_axes = [x for x in range(1, x.ndim)])
-        marker_prim(x, marker_id, self.op_type.value)
-        return x 
+        qx = quantize(x, calibration_axes=[x for x in range(1, x.ndim)], q = out_quantizer)
 
+        def output_init():
+          return qx
+        self.variable('quax', 'output', output_init)
+
+        quaxpr_default(qx, self.op_type,self )
+        return qx 
+
+def quantize(x, calibration_axes, q: Quantizer):
+    @jax.custom_vjp
+    def quant(x):
+        qx,grad =  q.quant(x, calibration_axes = calibration_axes)
+        return qx, qx.dequant()
+
+    def quant_fwd(x):
+        qx,grad =  q.quant(x, calibration_axes = calibration_axes)
+        return (qx, qx.dequant()), grad 
+
+    def quant_bwd(res, g):
+        quant_grad = res
+        return quant_grad(g[1])[0],
+
+    quant.defvjp(quant_fwd, quant_bwd)
+    qx, x = quant(x)
+    quaxt = QuaxTensor(x = x, qx = qx, bits = q.numerics.bits)
+    return quaxt 
 
 def is_quantized(x):
     return isinstance(x, QTensor)
@@ -98,14 +124,49 @@ def unwrapped(x):
     else:
         return x
 
-def qtensor_reshape(shape, x):
-    qval = x.qvalue.reshape(shape)
-    assert np.prod(x.scale[0].shape) == 1, "need single scale for reshape"
-    new_scales = [ scale.reshape((1,) * qval.ndim) for scale in x.scale]
-    assert x.scale_t is None, "don't know how to handle this"
+@aqt_utils.flax_slots_kw_only_dataclass
+class QuaxTensor:
+    x: jnp.ndarray
+    qx: aqt_tensor.QTensor
+    bits: int
+
+    @property 
+    def shape(self):
+        return self.x.shape
+
+    @property 
+    def ndim(self):
+        return self.x.ndim
+
+    @property
+    def bits(self):
+        return self.bits.item()
+
+    def to_np(self):
+        np_x = np.array(self.x)
+        np_qx = QuaxTensor
+        return QuaxTensor(x = np_x, qx = np_qx, bits=self.bits)
+
+    def reshape(self, shape):
+        quaxtensor_reshape(shape, self)
+        return self
+    def quantized_tensor(self):
+        return self.qx.qvalue
+
+def quaxtensor_reshape(shape, quaxt):
+    quaxpr_functional(quaxt, Operation.RESHAPE )
+    quaxt.x = quaxt.x.reshape(shape)
+
+    qval = quaxt.qx.qvalue.reshape(shape)
+    batch_size = shape[0]
+    assert np.prod(quaxt.qx.scale[0].shape) == batch_size, "need single scale for reshape"
+    new_scales = [ scale.reshape((batch_size,) + (1,) * (qval.ndim-1)) for scale in quaxt.qx.scale]
+    assert quaxt.qx.scale_t is None, "don't know how to handle this"
     #TODO - scale_t reshape
-    new_qtensor = QTensor(qvalue= qval, scale=new_scales,scale_t = None, dequant_dtype = x.dequant_dtype)
-    return new_qtensor
+    qx = QTensor(qvalue= qval, scale=new_scales,scale_t = None, dequant_dtype = quaxt.qx.dequant_dtype, bias=quaxt.qx.bias)
+    quaxt.qx = qx
+    quaxpr_functional(quaxt, Operation.RESHAPE )
+    return quaxt
 
 def reshape(shape, x):
     if is_quantized(x):
@@ -131,27 +192,28 @@ class Activation(nn.Module):
     @nn.compact
     def __call__(self, x):
         #x = x.dequant()
-        marker_id = id_gen.next()
-        marker_prim(x, marker_id, self.op_type.value)
-        self.sow('quax', 'start',marker_id)
-        #keep rhs bits here for fun
-        self.sow('quax', 'bits', {'lhs': self.lhs_bits, 'rhs': self.lhs_bits, 'out': self.lhs_bits})
-        quantized = is_quantized(x)
-        cfg = OpConfig(self.lhs_bits, self.lhs_bits, enabled = quantized)
-        if quantized:
-            x = x.dequant()
+        out_quantizer = quantizer(self.lhs_bits, po2_scaling = False)
+        quaxpr_default(x, self.op_type,self )
+        x = x.dequant()
         x = self.act_fn(x)
-        self.sow('quax', 'end', marker_id)
-        x = cfg.quantize(self, x, calibration_axes = [x for x in range(1, x.ndim)], po2_scaling = True)
-        marker_prim(x, marker_id, self.op_type.value)
+        qx = quantize(x, calibration_axes=[x for x in range(1, x.ndim)], q = out_quantizer)
+        def output_init():
+          return qx
+        self.variable('quax', 'output', output_init)
+        quaxpr_default(x, self.op_type,self )
         return x
 
+def map_appended_activation(act_fn):
+    act_map = {}
+    act_map[nn.relu] = AppendedActivation.RELU
+    act_map[nn.relu6] = AppendedActivation.RELU6
+    act_map[None] = None
+    return act_map[act_fn]
 
 class QDense(nn.Module):
     features: int
     lhs_bits: int
     rhs_bits: int
-    quantized: bool
     use_bias: bool = True
     kernel_init: Initializer = default_kernel_init
     bias_init: Initializer = initializers.zeros_init()
@@ -161,51 +223,63 @@ class QDense(nn.Module):
 
     @nn.compact
     def __call__(self, x):
+        #need to wrap operation in the quaxpr
+        quaxpr_default(x, self.op_type,self )
+
+        out_quantizer = quantizer(self.lhs_bits, po2_scaling = False)
+        rhs_quantizer = quantizer(self.rhs_bits, po2_scaling = False)
+        bias_quantizer = quantizer(bits=16, po2_scaling = False)
+
         allowed_acts = [nn.relu, nn.relu6, None]
         assert self.act_fn in allowed_acts, f"can't fuse act fn {self.act_fn}"
         #TODO - assignment means here
-        cfg = OpConfig(self.lhs_bits,self.rhs_bits, enabled = self.quantized)
-        marker_id = id_gen.next()
-        marker_prim(x, marker_id, self.op_type.value)
 
         #x = x.dequant()
-        self.sow('quax', 'start',marker_id)
-        self.sow('quax', 'bits', {'lhs': self.lhs_bits, 'rhs': self.rhs_bits, 'out': self.lhs_bits})
-
-        #x = x.dequant()
-
         kernel = self.param(
           'kernel',
           self.kernel_init,
-          (jnp.shape(x)[-1], self.features),
+          (x.shape[-1], self.features),
           self.param_dtype,
         )
+        kernel = quantize(kernel, calibration_axes = -1, q = rhs_quantizer)
+        def kernel_init():
+          return kernel
+        self.variable('quax', 'kernel', kernel_init)
+
         if self.use_bias:
           bias = self.param(
             'bias', self.bias_init, (self.features,), self.param_dtype
           )
-          bias = cfg.bias_quantize(self, bias, calibration_axes = -1)
+          bias = quantize(bias, calibration_axes = -1, q = bias_quantizer)
+          def bias_init():
+            return bias 
+          self.variable('quax', 'bias', bias_init)
         else:
           bias = None
-
-        dot_general = cfg.dot_general()
-        x = dot_general(
-          x,
-          kernel,
+        
+        #TODO -look at speedups from quantized vectors 
+        x = lax.dot_general(
+          x.x,
+          kernel.x,
           (((x.ndim - 1,), (0,)), ((), ())),
           precision=None,
         )
         if bias is not None:
             #bias has been quantized and dequantized by this point 
-            x += jnp.reshape(bias, (1,) * (x.ndim - 1) + (-1,))
+            x += jnp.reshape(bias.x, (1,) * (x.ndim - 1) + (-1,))
         if self.act_fn:
             x = self.act_fn(x)
+        
+        qx = quantize(x, calibration_axes=-1, q = out_quantizer)
 
+        #q = cfg.quantizer(po2_scaling=False, bits= self.lhs_bits)
+        #aqt_x, x = quantize(x, q, calibration_axes=-1)
+        #qx = QuaxTensor(x = x, qx = aqt_x)
 
-        qx = cfg.quantize(self, x, calibration_axes=-1)
-
-        marker_prim(qx, marker_id, self.op_type.value)
-        self.sow('quax', 'end', marker_id)
+        def output_init():
+          return qx
+        self.variable('quax', 'output', output_init)
+        quaxpr_default(qx, self.op_type,self, act_fn = map_appended_activation(self.act_fn))
         return qx 
 
 class QConv(nn.Module):
@@ -262,6 +336,7 @@ class QConv(nn.Module):
   precision: PrecisionLike = None
   kernel_init: Initializer = default_kernel_init
   bias_init: Initializer = initializers.zeros_init()
+  act_fn: nn.activation = None 
   op_type: Operation = Operation.CONV
 
   @property
@@ -295,14 +370,9 @@ class QConv(nn.Module):
     Returns:
       The convolved data.
     """
-    cfg = OpConfig(self.lhs_bits,self.rhs_bits, enabled = self.quantized)
-    marker_id = id_gen.next()
-    marker_prim(x, marker_id, self.op_type.value)
-
-    #x = x.dequant()
-    self.sow('quax', 'start',marker_id)
-    self.sow('quax', 'bits', {'lhs': self.lhs_bits, 'rhs': self.rhs_bits, 'out': self.lhs_bits})
-
+    quaxpr_default(x, self.op_type,self )
+    allowed_acts = [nn.relu, nn.relu6, None]
+    assert self.act_fn in allowed_acts, f"can't fuse act fn {self.act_fn}"
     kernel_size: Sequence[int]
     if isinstance(self.kernel_size, int):
       kernel_size = (self.kernel_size,)
@@ -332,6 +402,10 @@ class QConv(nn.Module):
     #  inputs = jnp.reshape(inputs, flat_input_shape)
 
     # self.strides or (1,) * (inputs.ndim - 2)
+
+    out_quantizer = quantizer(self.lhs_bits, po2_scaling = False)
+    rhs_quantizer = quantizer(self.rhs_bits, po2_scaling = False)
+    bias_quantizer = quantizer(bits=16, po2_scaling = False)
 
     strides = maybe_broadcast(self.strides)
     input_dilation = maybe_broadcast(self.input_dilation)
@@ -416,8 +490,14 @@ class QConv(nn.Module):
       'kernel', self.kernel_init, kernel_shape, self.param_dtype
     )
 
+
     if self.mask is not None:
       kernel *= self.mask
+
+    kernel = quantize(kernel, calibration_axes = -1, q = rhs_quantizer)
+    def kernel_init():
+      return kernel
+    self.variable('quax', 'kernel', kernel_init)
 
     if self.use_bias:
       if self.shared_weights:
@@ -428,17 +508,19 @@ class QConv(nn.Module):
         bias_shape = conv_output_shape[1:]
 
       bias = self.param('bias', self.bias_init, bias_shape, self.param_dtype)
-      bias = cfg.bias_quantize(self, bias, calibration_axes = -1)
+      bias = quantize(bias, calibration_axes = -1, q = bias_quantizer)
+      def bias_init():
+        return bias 
+      self.variable('quax', 'bias', bias_init)
     else:
       bias = None
 
 
     #inputs, kernel, bias = promote_dtype(inputs, kernel, bias, dtype=self.dtype)
     if self.shared_weights:
-      conv_general_dilated = cfg.conv_general_dilated()
-      y = conv_general_dilated(
-        x,
-        kernel,
+      y = lax.conv_general_dilated(
+        x.x,
+        kernel.x,
         strides,
         padding_lax,
         lhs_dilation=input_dilation,
@@ -462,16 +544,14 @@ class QConv(nn.Module):
         )
 
     if self.use_bias:
-        bias = bias.reshape((1,) * (y.ndim - bias.ndim) + bias.shape)  # type: ignore
-        y += bias
+        y += bias.x.reshape((1,) * (y.ndim - bias.ndim) + bias.shape)  # type: ignore
 
-    qy = cfg.quantize(self, y, calibration_axes=[x for x in range(1, y.ndim)])
-    marker_prim(qy, marker_id, self.op_type.value)
-    self.sow('quax', 'end', marker_id)
+    if self.act_fn:
+        y = self.act_fn(y)
 
-    #TODO handle this case
-    #if num_batch_dimensions != 1:
-    #  output_shape = input_batch_shape + y.shape[1:]
-    #  y = jnp.reshape(y, output_shape)
-
+    qy = quantize(y, calibration_axes=[x for x in range(1, y.ndim)], q = out_quantizer)
+    def output_init():
+      return qy
+    self.variable('quax', 'output', output_init)
+    quaxpr_default(qy, self.op_type,self, lhs_dilation=input_dilation, rhs_dilation=kernel_dilation,window_strides=strides)
     return qy

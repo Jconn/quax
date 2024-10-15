@@ -20,6 +20,38 @@ from typing import Literal, Optional, TypeAlias, Union
 from aqt.jax.v2.aqt_dot_general import LocalAqt
 from aqt.jax.v2.aqt_dot_general import dot_general_make
 from aqt.jax.v2.aqt_dot_general import DotGeneral
+from aqt.jax.v2.aqt_tensor import QTensor
+from aqt.jax.v2.aqt_dot_general import MultiTensor 
+from aqt.jax.v2 import aqt_tensor
+from quax import aqt_quax
+
+
+
+def quantizer(bits, po2_scaling = False):
+    #TODO - how to deal with context
+    dtype = bits_to_type(bits)
+    quant_calib = functools.partial(
+        calibration.AbsMaxCalibration,
+        po2_scale=po2_scaling,
+    )
+    quant = Quantizer(
+        numerics=int_numerics.IntSymmetric(
+            bits=bits,
+            preserve_zero=True,
+            preserve_max_val=False,
+            clip=True,
+            clip_gradient=False,
+            round=True,
+            noise_fn=None,
+            dtype = dtype,
+        ),
+        calib_shared_axes=None,
+        scale_stop_grad=True,
+        calibration=quant_calib,
+        context=aqt_utils.Context(key=None, train_step=None)
+        )
+    quant.init_calibration()
+    return quant
 
 def quantized_dg_cfg(
     *,
@@ -79,7 +111,9 @@ def quantized_dg_cfg(
 
   if use_dummy_static_bound:
     aqt_config.set_static_bound(cfg, 1.0)
-
+  
+  #force dummy gradient allow since we don't update lhs quant details 
+  cfg.fwd.allow_dummy_gradient_into_qtensor = True
   assert cfg.fwd.local_aqt is None, 'local_aqt is not yet supported in fwd.'
 
   return cfg
@@ -95,11 +129,11 @@ class OpConfig:
         if self.enabled:
             aqt_bit_cfg =  quantized_dg_cfg(lhs_bits=self.lhs_bits,rhs_bits=self.rhs_bits, bwd_bits=self.lhs_bits)
             dg = functools.partial(
-              aqt_flax.AqtDotGeneral,
+              aqt_quax.QuaxDotGeneral,
+              #aqt_flax.AqtDotGeneral,
               aqt_bit_cfg, 
-              use_legacy_freezer=False,
-              lhs_quant_mode=aqt_utils.QuantMode.CONVERT,
-              rhs_quant_mode=aqt_utils.QuantMode.SERVE,
+              lhs_quant_mode=aqt_utils.QuantMode.TRAIN,
+              rhs_quant_mode=aqt_utils.QuantMode.TRAIN,
               lhs_freeze_mode=aqt_flax.FreezerMode.CALIBRATION,
               rhs_freeze_mode=aqt_flax.FreezerMode.CALIBRATION_AND_VALUE,
             )
@@ -114,8 +148,8 @@ class OpConfig:
             aqt_conv_dilated = functools.partial(
                 aqt_flax.AqtConvGeneralDilated,
                 aqt_bit_cfg,
-                lhs_quant_mode=aqt_utils.QuantMode.CONVERT,
-                rhs_quant_mode=aqt_utils.QuantMode.SERVE,
+              lhs_quant_mode=aqt_utils.QuantMode.TRAIN,
+              rhs_quant_mode=aqt_utils.QuantMode.TRAIN,
                 tiling_cfg=None,
                 lhs_freeze_mode=aqt_flax.FreezerMode.CALIBRATION,
                 rhs_freeze_mode=aqt_flax.FreezerMode.CALIBRATION_AND_VALUE,
@@ -147,39 +181,31 @@ class OpConfig:
         quant.init_calibration()
         return quant
 
-    def quantizer(self, po2_scaling = False):
+    def quantizer(self, po2_scaling = False, bits = None):
         #TODO - how to deal with context
         #TODO the calibration axes should be parameterized I thin
+        if bits is None:
+            bits = self.lhs_bits
         lhs_type = bits_to_type(self.lhs_bits)
         quant = Quantizer(
             numerics=int_numerics.IntNumerics(
-                bits=self.lhs_bits,
+                bits=bits,
                 preserve_zero=True,
-                preserve_max_val=True,
+                preserve_max_val=False,
                 clip=True,
-                clip_gradient=True,
+                clip_gradient=False,
                 round=True,
                 noise_fn=None,
                 dtype = lhs_type,
             ),
-            calib_shared_axes=0,
+            calib_shared_axes=None,
             scale_stop_grad=True,
             calibration=calibration.AbsMaxCalibration,
             po2_scale=po2_scaling,
-            context=aqt_utils.Context(key=jax.random.PRNGKey(0), train_step=0))
+            context=aqt_utils.Context(key=None, train_step=None)
+            )
         quant.init_calibration()
         return quant
-
-    def quantize(self, mdl, x, calibration_axes, po2_scaling = False):
-        if not self.enabled:
-            return x
-        q = self.quantizer(po2_scaling = po2_scaling)
-        qx,_ =  q.quant(x, calibration_axes = calibration_axes)
-        def initializer():
-          return qx.without_qvalue() 
-
-        mdl.variable('aqt', 'output', initializer)
-        return qx
 
     def bias_quantize(self, mdl, bias, calibration_axes):
         if not self.enabled:
