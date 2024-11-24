@@ -5,7 +5,7 @@ from tflite_schema_py_generated import (Model, SubGraph, Tensor, OperatorCode,
                                         Buffer, Operator, BuiltinOperator, 
                                         BuiltinOptions, FullyConnectedOptions,
                                         ActivationFunctionType, AddOptions, TensorMap,
-                                        SignatureDef, Metadata, QuantizationParameters, ReshapeOptions, TensorType, Conv2DOptions,ActivationFunctionType)
+                                        SignatureDef, Metadata, QuantizationParameters, ReshapeOptions, TensorType, Conv2DOptions,ActivationFunctionType, Padding)
 
 from enum import Enum
 import jax.numpy as jnp
@@ -127,7 +127,6 @@ def add_tensor(builder, tensor_name, np_data, buffers, quantization_params = Non
     
     #TODO - need to deal with empty buffer
     #add buffer we use here
-    print(np_data.dtype)
     data_vector = builder.CreateByteVector(np.ravel(np_data).tobytes())
     Buffer.Start(builder)
     Buffer.AddData(builder, data_vector)
@@ -262,13 +261,20 @@ def add_reshape_layer(builder, input_tensor, output_tensor, new_shape, all_tenso
     reshape_op = add_operator(builder, reshape_inputs, reshape_outputs, reshape_options, BuiltinOptions.BuiltinOptions().ReshapeOptions, reshape_opcode, all_opcodes)
     return reshape_op
 
-def add_conv_layer(builder, input_tensor, weight_tensor, bias_tensor, output_tensor,bias_dtype, all_tensors, all_opcodes):
+def add_conv_layer(builder, input_tensor, weight_tensor, bias_tensor, output_tensor,bias_dtype,activation_op, all_tensors, all_opcodes,quax_params):
     Conv2DOptions.Start(builder)
     #TODO - need to deal with fusion here - is here a way to do this?
-    Conv2DOptions.AddQuantizedBiasType(builder, map_tensor_type(bias_dtype))
+    if bias_tensor:
+        Conv2DOptions.AddQuantizedBiasType(builder, map_tensor_type(bias_dtype))
     #TODO - conv stride options
     Conv2DOptions.AddStrideH(builder, 1)
     Conv2DOptions.AddStrideW(builder, 1)
+    Conv2DOptions.AddFusedActivationFunction(builder,activation_op)
+    if quax_params['padding'] == 'SAME':
+        padding = Padding.Padding.SAME 
+    else:
+        padding = Padding.Padding.VALID 
+    Conv2DOptions.AddPadding(builder, padding)
     conv_options = Conv2DOptions.End(builder)
     OperatorCode.Start(builder)
     OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().CONV_2D)
@@ -276,7 +282,11 @@ def add_conv_layer(builder, input_tensor, weight_tensor, bias_tensor, output_ten
     
     #TODO - ordering here is fragile but important
 
-    conv_inputs = create_operator_inputs(builder, [input_tensor, weight_tensor, bias_tensor], all_tensors)
+    if bias_tensor:
+        conv_inputs = create_operator_inputs(builder, [input_tensor, weight_tensor, bias_tensor], all_tensors)
+    else:
+        conv_inputs = create_operator_inputs(builder, [input_tensor, weight_tensor], all_tensors)
+
     conv_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
 
     Operator.Start(builder)
@@ -284,7 +294,7 @@ def add_conv_layer(builder, input_tensor, weight_tensor, bias_tensor, output_ten
     Operator.AddInputs(builder, conv_inputs)
     Operator.AddOutputs(builder, conv_outputs)
     Operator.AddBuiltinOptions(builder, conv_options)
-    Operator.AddBuiltinOptionsType(builder, BuiltinOptions.BuiltinOptions().FullyConnectedOptions)
+    Operator.AddBuiltinOptionsType(builder, BuiltinOptions.BuiltinOptions().Conv2DOptions)
     conv_op = Operator.End(builder)
 
     conv_op = add_operator(builder, conv_inputs, conv_outputs, conv_options, BuiltinOptions.BuiltinOptions().Conv2DOptions, conv_opcode, all_opcodes)

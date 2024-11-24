@@ -41,7 +41,7 @@ from jax.experimental import jax2tf
 import tensorflow as tf
 
 from quax.jax2tflite import FBB
-from quax.quax import QDense, Quantize, QConv, id_gen
+from quax.quax import QDense, Quantize, QConv
 from quax import quax
 
 class CNN(nn.Module):
@@ -50,8 +50,8 @@ class CNN(nn.Module):
     @nn.compact
     def __call__(self, x):
         act_bits = 16 
-        weight_bits = 2 
-        bias = True 
+        weight_bits = 3 
+        bias = False 
         #x = Quantize(bits=act_bits, quantized = self.quantized)(x)
         #x = QConv(features=32, kernel_size=(3, 3), lhs_bits = act_bits, rhs_bits = weight_bits, quantized= self.quantized, act_fn = nn.relu, use_bias = bias)(x)
         #x = QConv(features=64, kernel_size=(3, 3), lhs_bits = act_bits, rhs_bits = weight_bits,quantized=self.quantized, act_fn = nn.relu, use_bias = bias)(x)
@@ -62,32 +62,14 @@ class CNN(nn.Module):
         #    x = x.dequant()
 
         use_running_avg = False
-        #x = nn.Conv(
-        #    features=32, kernel_size=(3, 3))(x)
-        #x = nn.BatchNorm(use_running_average=use_running_avg, dtype=x.dtype)(x)
-        #x = nn.relu(x)
-        #x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
-        #x = nn.Conv(
-        #    features=64, kernel_size=(3, 3))(x)
-        ##x = nn.BatchNorm(use_running_average=use_running_avg, dtype=x.dtype)(x)
-        #x = nn.relu(x)
-        #x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
-        #x = x.reshape((x.shape[0], -1))  # flatten
-        #x = nn.Dense(features=256)(x)
-        #x = nn.relu(x)
-        #x = nn.Dense(features=10)(x)
-
         x = Quantize(bits=act_bits, quantized = self.quantized)(x)
-        x = QConv(features=32, kernel_size=(3, 3), lhs_bits = act_bits, rhs_bits = weight_bits, quantized= self.quantized, act_fn = nn.relu, use_bias = bias)(x)
-        x = QConv(features=64, kernel_size=(3, 3), lhs_bits = act_bits, rhs_bits = weight_bits,quantized=self.quantized, act_fn = nn.relu, use_bias = bias)(x)
-
+        x = QConv(features=32, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, quantized= self.quantized, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+        x = QConv(features=64, kernel_size=(3, 3), lhs_bits = act_bits, rhs_bits = weight_bits,quantized=self.quantized, act_fn = nn.relu, use_bias = True)(x)
         x = x.reshape((x.shape[0], -1))
-
+        x = QDense(features=512,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
         x = QDense(features=256,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
-        x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias)(x)
-        if self.quantized: 
-            x = x.x
-        return x
+        x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = False)(x)
+        return x.x
 
 @functools.partial(jax.jit, static_argnums=(3,))
 def apply_model(model_params, images, labels, apply_fn):
@@ -152,6 +134,7 @@ def train_epoch(state, train_ds, batch_size, rng):
     state = update_model(state, grads, updated_var)
     epoch_loss.append(loss)
     epoch_accuracy.append(accuracy)
+
   train_loss = np.mean(epoch_loss)
   train_accuracy = np.mean(epoch_accuracy)
 
@@ -407,94 +390,87 @@ def calibrate(state: TrainState, calibration_steps: int) -> TrainState:
   return state.replace(model=model_calibrated)
 
 
-@functools.partial(jax.jit, static_argnums=(1,))
-def serve(state: TrainState, weight_only: bool = True):
+def serve(tflite_model, state, weight_only: bool = True):
   """Take train state, freeze integer weights, and serve."""
   # get sample serving data
   _, test_ds = get_datasets()
   sample_image, sample_label = test_ds['image'][:64], test_ds['label'][:64]
   # serving
   # make tflite
-  serve_fn, model_serving = serving_conversion(state, weight_only=weight_only)
-  logits = serve_fn(
-      model_serving, sample_image, rngs={'params': jax.random.PRNGKey(0)} 
-  )
+
+  interpreter = tf.lite.Interpreter(model_path=tflite_model)
+  interpreter.allocate_tensors()
+  out_logs = None
+  for i in range(sample_image.shape[0]):
+      logits = tflite_invoke(interpreter, sample_image[i:i+1,...])
+      if out_logs is None:
+          out_logs = logits
+      else:
+          out_logs = jnp.concat([out_logs, logits], axis=0)
+
   # compute serving loss
   one_hot = jax.nn.one_hot(sample_label, 10)
-  loss = jnp.mean(optax.softmax_cross_entropy(logits=logits, labels=one_hot))
-  return loss, model_serving
 
 
-def serve_fn_hlo(state):
-  """Example on how to inspect HLO to verify if everything was quantized."""
-  # get sample serving data
-  _, test_ds = get_datasets()
-  sample_image = test_ds['image'][:64]
-  # serving
-  serve_fn, model_serving = serving_conversion(state)
-  # The following XLA graph is only needed for debugging purpose
-  hlo = jax.jit(serve_fn).lower(
-      model_serving,
-      sample_image,
-      rngs={'params': jax.random.PRNGKey(0)},
-  ).compiler_ir('hlo').as_hlo_module()
-  return hlo
+  mlogits, updated_var = state.cnn_train.apply(state.model,sample_image,rngs={'params': jax.random.PRNGKey(0)},mutable=True,)
+  tfl_loss = jnp.mean(optax.softmax_cross_entropy(logits=out_logs, labels=one_hot))
+  jax_loss = jnp.mean(optax.softmax_cross_entropy(logits=mlogits, labels=one_hot))
+  print(f"jax vs tflite loss {jax_loss} - {tfl_loss}")
+  import pdb; pdb.set_trace()
 
-def to_tflite(model, params, batch_stats):
+  #tflite loss 5.71
+  return loss
 
-    def apply_model(x):
-        #abs_x, theta_cos, theta_sin = get_tflite_details(noisy_f)
-        return model({"params": params, "batch_stats": batch_stats}, x)
-    input_shape = [1,28,28,1] 
-    #model = cnn_train.init({'params': rng}, jnp.ones([1, 28, 28, 1]))
-    tf_apply = jax2tf.convert(apply_model, enable_xla = False)
+def tflite_invoke(interpreter, float_input):
+    interpreter.allocate_tensors()
 
-    class QuantizedModule(tf.Module):
-        def __init__(self, apply_fn):
-            super().__init__()
-            self.apply_fn = apply_fn 
-        
-        @tf.function(input_signature=[tf.TensorSpec(input_shape, tf.int8)])
-        def __call__(self, x):
-            return self.apply_fn(x)
-        @tf.function(input_signature=[tf.TensorSpec(input_shape, tf.int8)])
-        def call(self, x):
-            return self.apply_fn(x)
-    tf_model = QuantizedModule(tf_apply)
+    # Get input and output details
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
 
+    # Assuming a single input tensor
+    input_index = input_details[0]['index']
+    input_shape = input_details[0]['shape']
+
+    # Read quantization parameters
+    quantization_params = input_details[0]['quantization']  # (scale, zero_point)
+    scale, zero_point = quantization_params
+
+    # Quantize the float input to int16
+    quantized_input = np.round(float_input / scale + zero_point).astype(np.int16)
+
+    # Ensure the input tensor matches the expected type and shape
+    #interpreter.set_tensor(0,input_index)
+    interpreter.set_tensor(input_index, quantized_input)
+
+    # Run inference
+    interpreter.invoke()
+    # Get the output
+    output_data = interpreter.get_tensor(output_details[0]['index'])
+
+    # If the output is quantized, dequantize it for interpretation
+    output_quant_params = output_details[0]['quantization']
+    output_scale, output_zero_point = output_quant_params
+    if output_scale != 0:  # Check if quantization is used
+        output_data = (output_data.astype(np.float32) - output_zero_point) * output_scale
+    return output_data
 
 def main(argv):
   del argv
 
   # 1. TRAIN.
   state = train_and_evaluate(
-      num_epochs=3, workdir='/tmp/aqt_mnist_example')
+      num_epochs=1, workdir='/tmp/aqt_mnist_example')
 
-  # 2. Calibration.
-  #update_cfg_with_calibration(state.cnn_train.aqt_cfg)
-  #update_cfg_with_calibration(state.cnn_eval.aqt_cfg)
-  #state = calibrate(state, calibration_steps=10)
-
-  ## 3. TRAIN with the calibrated stats.
-  #state = train_and_evaluate(
-  #    num_epochs=1, workdir='/tmp/aqt_mnist_example', state=state
-  #)
-
-  # 4. CONVERT & SERVE.
-
-
-  #(Pdb) x.shape
-  #(1, 28, 28, 1)
   x = jnp.ones([1, 28, 28, 1])
   converter = FBB()
   tflite = converter.convert(state.cnn_train, state.model, x)
   with open('mnist_quax.tflite', 'wb') as f:
       f.write(tflite)
-  import pdb; pdb.set_trace()
-  loss, serving_model = serve(state, weight_only=False)
+
+  loss, serving_model = serve('mnist_quax.tflite', state, weight_only=False)
   print('serve loss on sample ds: {}'.format(loss))
 
-  #to_tflite(state.cnn_eval.apply, serving_model['params'], serving_model['batch_stats'])
   #(Pdb) serving_model['aqt']['Conv_1']['AqtConvGeneralDilated_0']['qrhs']
 if __name__ == '__main__':
     app.run(main)

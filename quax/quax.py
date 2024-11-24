@@ -36,18 +36,14 @@ from flax.typing import (
   Sequence
 )
 
+def store_quantized(mdl, name, qxtensor):
+    init_fn = lambda: 0
+    reduce_fn = lambda a, b:  b
+    #will return true if the store succeeds
+    #will fail by default when no longer mutable
+    return mdl.sow('quax', name, qxtensor,
+                  init_fn=init_fn, reduce_fn=reduce_fn)
 
-
-class MID:
-    def __init__(self):
-        self.current_id = 0
-    def reset(self):
-        self.current_id = 0
-    def next(self):
-        next_id = self.current_id
-        self.current_id += 1
-        return next_id
-id_gen = MID()
 
 default_kernel_init = initializers.lecun_normal()
 marker_p = core.Primitive("marker")
@@ -87,11 +83,9 @@ class Quantize(nn.Module):
         out_quantizer = quantizer(self.bits, po2_scaling = False)
        
 
-        qx = quantize(x, calibration_axes=[x for x in range(1, x.ndim)], q = out_quantizer)
+        qx = quantize(x, calibration_axes=[x for x in range(0, x.ndim)], q = out_quantizer)
 
-        def output_init():
-          return qx
-        self.variable('quax', 'output', output_init)
+        store_quantized(self, 'output', qx)
 
         quaxpr_default(qx, self.op_type,self )
         return qx 
@@ -159,8 +153,8 @@ def quaxtensor_reshape(shape, quaxt):
 
     qval = quaxt.qx.qvalue.reshape(shape)
     batch_size = shape[0]
-    assert np.prod(quaxt.qx.scale[0].shape) == batch_size, "need single scale for reshape"
-    new_scales = [ scale.reshape((batch_size,) + (1,) * (qval.ndim-1)) for scale in quaxt.qx.scale]
+    assert np.prod(quaxt.qx.scale[0].shape) == 1, "need single scale for reshape"
+    new_scales = [ scale.reshape((1,) + (1,) * (qval.ndim-1)) for scale in quaxt.qx.scale]
     assert quaxt.qx.scale_t is None, "don't know how to handle this"
     #TODO - scale_t reshape
     qx = QTensor(qvalue= qval, scale=new_scales,scale_t = None, dequant_dtype = quaxt.qx.dequant_dtype, bias=quaxt.qx.bias)
@@ -197,9 +191,7 @@ class Activation(nn.Module):
         x = x.dequant()
         x = self.act_fn(x)
         qx = quantize(x, calibration_axes=[x for x in range(1, x.ndim)], q = out_quantizer)
-        def output_init():
-          return qx
-        self.variable('quax', 'output', output_init)
+        store_quantized(self, 'output', qx)
         quaxpr_default(x, self.op_type,self )
         return x
 
@@ -241,23 +233,22 @@ class QDense(nn.Module):
           (x.shape[-1], self.features),
           self.param_dtype,
         )
-        kernel = quantize(kernel, calibration_axes = -1, q = rhs_quantizer)
-        def kernel_init():
-          return kernel
-        self.variable('quax', 'kernel', kernel_init)
+
+
+        kernel = quantize(kernel, calibration_axes = [tmp for tmp in range(0, kernel.ndim)], q = rhs_quantizer)
+
+        store_quantized(self, 'kernel', kernel)
 
         if self.use_bias:
           bias = self.param(
             'bias', self.bias_init, (self.features,), self.param_dtype
           )
-          bias = quantize(bias, calibration_axes = -1, q = bias_quantizer)
-          def bias_init():
-            return bias 
-          self.variable('quax', 'bias', bias_init)
+          bias = quantize(bias, calibration_axes = [tmp for tmp in range(0, bias.ndim)], q = bias_quantizer)
+          store_quantized(self, 'bias', bias)
         else:
           bias = None
-        
         #TODO -look at speedups from quantized vectors 
+        #import pdb; pdb.set_trace()
         x = lax.dot_general(
           x.x,
           kernel.x,
@@ -267,18 +258,13 @@ class QDense(nn.Module):
         if bias is not None:
             #bias has been quantized and dequantized by this point 
             x += jnp.reshape(bias.x, (1,) * (x.ndim - 1) + (-1,))
+            #x += jnp.reshape(bias, (1,) * (x.ndim - 1) + (-1,))
         if self.act_fn:
             x = self.act_fn(x)
         
-        qx = quantize(x, calibration_axes=-1, q = out_quantizer)
+        qx = quantize(x, calibration_axes=[y for y in range(0, x.ndim)], q = out_quantizer)
 
-        #q = cfg.quantizer(po2_scaling=False, bits= self.lhs_bits)
-        #aqt_x, x = quantize(x, q, calibration_axes=-1)
-        #qx = QuaxTensor(x = x, qx = aqt_x)
-
-        def output_init():
-          return qx
-        self.variable('quax', 'output', output_init)
+        store_quantized(self, 'output', qx)
         quaxpr_default(qx, self.op_type,self, act_fn = map_appended_activation(self.act_fn))
         return qx 
 
@@ -411,6 +397,7 @@ class QConv(nn.Module):
     input_dilation = maybe_broadcast(self.input_dilation)
     kernel_dilation = maybe_broadcast(self.kernel_dilation)
 
+
     padding_lax = flax.linen.linear.canonicalize_padding(self.padding, len(kernel_size))
     if padding_lax == 'CIRCULAR':
       kernel_size_dilated = [
@@ -494,10 +481,10 @@ class QConv(nn.Module):
     if self.mask is not None:
       kernel *= self.mask
 
-    kernel = quantize(kernel, calibration_axes = -1, q = rhs_quantizer)
-    def kernel_init():
-      return kernel
-    self.variable('quax', 'kernel', kernel_init)
+
+
+    kernel = quantize(kernel, calibration_axes = [_ for _ in range(0,kernel.ndim-1)], q = rhs_quantizer)
+    store_quantized(self, 'kernel', kernel)
 
     if self.use_bias:
       if self.shared_weights:
@@ -509,9 +496,8 @@ class QConv(nn.Module):
 
       bias = self.param('bias', self.bias_init, bias_shape, self.param_dtype)
       bias = quantize(bias, calibration_axes = -1, q = bias_quantizer)
-      def bias_init():
-        return bias 
-      self.variable('quax', 'bias', bias_init)
+
+      store_quantized(self, 'bias', bias)
     else:
       bias = None
 
@@ -549,9 +535,9 @@ class QConv(nn.Module):
     if self.act_fn:
         y = self.act_fn(y)
 
-    qy = quantize(y, calibration_axes=[x for x in range(1, y.ndim)], q = out_quantizer)
-    def output_init():
-      return qy
-    self.variable('quax', 'output', output_init)
-    quaxpr_default(qy, self.op_type,self, lhs_dilation=input_dilation, rhs_dilation=kernel_dilation,window_strides=strides)
+    qy = quantize(y, calibration_axes=[x for x in range(0, y.ndim)], q = out_quantizer)
+
+    store_quantized(self, 'output', qy)
+
+    quaxpr_default(qy, self.op_type,self, lhs_dilation=input_dilation, rhs_dilation=kernel_dilation,window_strides=strides, padding = self.padding, act_fn = map_appended_activation(self.act_fn))
     return qy

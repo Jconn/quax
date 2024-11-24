@@ -34,8 +34,12 @@ def make_quant_params(builder, qxt):
     weight_scale = aqt_weights.scale[0]
     #TODO - why are we indexing into weight scale
     dequantized_weights = weight * weight_scale[0]
-    weight_mins = jnp.min(dequantized_weights, axis=0)
-    weight_maxs = jnp.max(dequantized_weights, axis=0)
+    target_shape = weight_scale.shape
+    reduce_axes = tuple(i for i, (d1, d2) in enumerate(zip(dequantized_weights.shape, target_shape)) if d1 != d2)
+    weight_mins = jnp.min(dequantized_weights, axis=reduce_axes, keepdims=True)
+    weight_maxs = jnp.max(dequantized_weights, axis=reduce_axes, keepdims=True)
+
+    #need to find the algorithm that matches the mins to the scales
     #TODO - aqt has no zero point quant support
     weight_zero_point = jnp.zeros(weight_scale.shape, dtype=np.int32)
     weight_qparams = add_quantization_params(builder, weight_mins, weight_maxs, weight_scale, weight_zero_point, quantized_dim = 0)
@@ -180,7 +184,11 @@ class FBB:
         out_qxt = self.get_quaxtensor(quaxend, 'output')
         weight_qxt = self.get_quaxtensor(quaxend, 'kernel')
         has_bias = True
+
         bias_qxt = self.get_quaxtensor(quaxend, 'bias')
+        if bias_qxt == None:
+            has_bias = False
+            bias_tensor = None
 
         in_var = quaxbegin.invars[0]
         out_var = quaxend.invars[0]
@@ -197,8 +205,9 @@ class FBB:
         strides = quaxend.params['quax_pytree']['window_strides']
         lhs_dilation = quaxend.params['quax_pytree']['lhs_dilation']
         rhs_dilation = quaxend.params['quax_pytree']['rhs_dilation']
+        padding = quaxend.params['quax_pytree']
 
-        #set weights to be in shape (OC, KW, KH, IC)
+        #set weights to be in shape (OC, KH, KW, IC)
         weight = jnp.transpose(weight, [3,0,1,2])
         weight_tensor = add_tensor(self.builder, "weight", weight, self.buffers, quantization_params = weight_qparams, dtype = weight_dtype)
         self.record_weight(weight_tensor)
@@ -226,10 +235,12 @@ class FBB:
         #TODO - this is a mess..
         self.record_activation(out_var, out_tensor)
         self.record_quantization_details(out_var, (out_qparams, out_dtype) )
+        #self.record_weight(weight_var, weight_tensor)
+        activation_op = tflite_utils.map_appended_activation(quaxend.params['quax_pytree']['act_fn'])
         #TODO - how to record weight now
         #self.record_weight(bias_var, bias_tensor)
         #self.record_weight(weight_var, weight_tensor)
-        op = add_conv_layer(self.builder,input_tensor=activation_tensor, weight_tensor=weight_tensor,bias_tensor=bias_tensor,output_tensor=out_tensor, bias_dtype = bias_dtype, all_tensors=self.tensors, all_opcodes=self.opcodes) 
+        op = add_conv_layer(self.builder,input_tensor=activation_tensor, weight_tensor=weight_tensor,bias_tensor=bias_tensor,output_tensor=out_tensor, bias_dtype = bias_dtype, all_tensors=self.tensors, all_opcodes=self.opcodes,activation_op=activation_op, quax_params=quaxend.params['quax_pytree']) 
         self.record_op(op)
 
     
@@ -251,10 +262,13 @@ class FBB:
         out_var = quaxend.invars[0]
     
 
+        has_bias = True
         out_qxt = self.get_quaxtensor(quaxend, 'output')
         weight_qxt = self.get_quaxtensor(quaxend, 'kernel')
         bias_qxt = self.get_quaxtensor(quaxend, 'bias')
-        has_bias = True
+        if bias_qxt is None:
+            has_bias = False
+            bias_tensor = None
 
         out_dtype = bits_to_type(out_qxt.bits) 
         weight_dtype = bits_to_type(weight_qxt.bits) 
@@ -313,6 +327,8 @@ class FBB:
         param = self.model_params
         for link in weight_path:
             param = param[link]
+        if var_name not in param.keys():
+            return None
         return param[var_name]
        
 
@@ -332,9 +348,10 @@ class FBB:
 
         out_qparams = add_quantization_params(self.builder, None, None, out_scale, out_zp, quantized_dim = 0)
         out_tensor = add_empty_tensor(self.builder, "activation", quant_var.aval.shape, self.buffers, quantization_params = out_qparams, dtype = out_dtype)
-
         self.record_quantization_details(quant_var, (out_qparams, out_dtype) )
         self.record_activation(quant_var, out_tensor)
+        #also map the invar to this tensor, because quant is special
+        self.record_activation(quaxbegin.invars[0], out_tensor)
         #TODO - add quant op
 
     def find_model_io(self, model_jaxpr):
