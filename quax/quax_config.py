@@ -26,6 +26,35 @@ from aqt.jax.v2 import aqt_tensor
 from quax import aqt_quax
 
 
+def requantizer(bits, scale, po2_scaling = False):
+    #TODO - how to deal with context
+    dtype = bits_to_type(bits)
+    scale = scale[0][0]
+    bound = (1.0/scale).astype(dtype)
+    #TODO bias
+    quant_calib = functools.partial(
+        calibration.ConstantCalibration,
+        po2_scale=po2_scaling,
+        bound =bound 
+    )
+    quant = Quantizer(
+        numerics=int_numerics.IntSymmetric(
+            bits=bits,
+            preserve_zero=True,
+            preserve_max_val=False,
+            clip=True,
+            clip_gradient=False,
+            round=True,
+            noise_fn=None,
+            dtype = dtype,
+        ),
+        calib_shared_axes=None,
+        scale_stop_grad=True,
+        calibration=quant_calib,
+        context=aqt_utils.Context(key=None, train_step=None)
+        )
+    quant.init_calibration()
+    return quant
 
 def quantizer(bits, po2_scaling = False):
     #TODO - how to deal with context

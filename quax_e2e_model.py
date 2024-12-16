@@ -41,16 +41,15 @@ from jax.experimental import jax2tf
 import tensorflow as tf
 
 from quax.jax2tflite import FBB
-from quax.quax import QDense, Quantize, QConv
+from quax.quax import QDense, Quantize, QConv, enroll_model
 from quax import quax
 
 class CNN(nn.Module):
-    quantized: bool 
-  
     @nn.compact
     def __call__(self, x):
+        enroll_model(self)
         act_bits = 16 
-        weight_bits = 3 
+        weight_bits = 4
         bias = False 
         #x = Quantize(bits=act_bits, quantized = self.quantized)(x)
         #x = QConv(features=32, kernel_size=(3, 3), lhs_bits = act_bits, rhs_bits = weight_bits, quantized= self.quantized, act_fn = nn.relu, use_bias = bias)(x)
@@ -62,12 +61,16 @@ class CNN(nn.Module):
         #    x = x.dequant()
 
         use_running_avg = False
-        x = Quantize(bits=act_bits, quantized = self.quantized)(x)
-        x = QConv(features=32, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, quantized= self.quantized, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
-        x = QConv(features=64, kernel_size=(3, 3), lhs_bits = act_bits, rhs_bits = weight_bits,quantized=self.quantized, act_fn = nn.relu, use_bias = True)(x)
+        x = Quantize(bits=act_bits)(x)
+        x = QConv(features=32, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+        x = QConv(features=64, kernel_size=(3, 3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True)(x)
         x = x.reshape((x.shape[0], -1))
         x = QDense(features=512,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
         x = QDense(features=256,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
+        y = QDense(features=256,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
+        x = x + y
+        x = x * y 
+        x = quax.concatenate([x,y,x], axis=1)
         x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = False)(x)
         return x.x
 
@@ -134,6 +137,7 @@ def train_epoch(state, train_ds, batch_size, rng):
     state = update_model(state, grads, updated_var)
     epoch_loss.append(loss)
     epoch_accuracy.append(accuracy)
+    break
 
   train_loss = np.mean(epoch_loss)
   train_accuracy = np.mean(epoch_accuracy)
@@ -167,12 +171,12 @@ class TrainState(struct.PyTreeNode):
 
 def create_train_state(rng):
   """Creates initial `TrainState`."""
-  cnn_train = CNN(quantized=True)
+  cnn_train = CNN()
   model = cnn_train.init({'params': rng}, jnp.ones([1, 28, 28, 1]))
   learning_rate = 0.1
   momentum = 0.9
   tx = optax.sgd(learning_rate, momentum)
-  cnn_eval = CNN(quantized = True)
+  cnn_eval = CNN()
   return TrainState(
       cnn_train=cnn_train,
       cnn_eval=cnn_eval,
@@ -390,8 +394,7 @@ def calibrate(state: TrainState, calibration_steps: int) -> TrainState:
   return state.replace(model=model_calibrated)
 
 
-def serve(tflite_model, state, weight_only: bool = True):
-  """Take train state, freeze integer weights, and serve."""
+def test_translate(tflite_model, state, weight_only: bool = True):
   # get sample serving data
   _, test_ds = get_datasets()
   sample_image, sample_label = test_ds['image'][:64], test_ds['label'][:64]
@@ -415,11 +418,8 @@ def serve(tflite_model, state, weight_only: bool = True):
   mlogits, updated_var = state.cnn_train.apply(state.model,sample_image,rngs={'params': jax.random.PRNGKey(0)},mutable=True,)
   tfl_loss = jnp.mean(optax.softmax_cross_entropy(logits=out_logs, labels=one_hot))
   jax_loss = jnp.mean(optax.softmax_cross_entropy(logits=mlogits, labels=one_hot))
-  print(f"jax vs tflite loss {jax_loss} - {tfl_loss}")
-  import pdb; pdb.set_trace()
-
-  #tflite loss 5.71
-  return loss
+  if jnp.abs(jax_loss - tfl_loss) > .05:
+      raise Exception(f"tflite jax loss differs - tfl; {tfl_loss}, jax - {jax_loss}")
 
 def tflite_invoke(interpreter, float_input):
     interpreter.allocate_tensors()
@@ -468,8 +468,7 @@ def main(argv):
   with open('mnist_quax.tflite', 'wb') as f:
       f.write(tflite)
 
-  loss, serving_model = serve('mnist_quax.tflite', state, weight_only=False)
-  print('serve loss on sample ds: {}'.format(loss))
+  test_translate('mnist_quax.tflite', state, weight_only=False)
 
   #(Pdb) serving_model['aqt']['Conv_1']['AqtConvGeneralDilated_0']['qrhs']
 if __name__ == '__main__':

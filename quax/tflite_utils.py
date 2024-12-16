@@ -1,11 +1,12 @@
 import flatbuffers
 import numpy as np
 # Assuming the flatbuffer schema files have been generated and are available in your path
+import tflite_schema_py_generated as tfl
 from tflite_schema_py_generated import (Model, SubGraph, Tensor, OperatorCode,
                                         Buffer, Operator, BuiltinOperator, 
-                                        BuiltinOptions, FullyConnectedOptions,
-                                        ActivationFunctionType, AddOptions, TensorMap,
-                                        SignatureDef, Metadata, QuantizationParameters, ReshapeOptions, TensorType, Conv2DOptions,ActivationFunctionType, Padding)
+                                        BuiltinOptions, FullyConnectedOptions,ConcatenationOptions,
+                                        ActivationFunctionType, AddOptions, MulOptions, TensorMap,
+                                        SignatureDef, Metadata, QuantizationParameters, ReshapeOptions, TensorType, Conv2DOptions,ActivationFunctionType, Padding, QuantizeOptions)
 
 from enum import Enum
 import jax.numpy as jnp
@@ -199,6 +200,34 @@ def add_add_layer(builder, input_tensor1, input_tensor2, output_tensor, all_tens
     add_op = add_operator(builder, add_inputs, add_outputs, add_options, BuiltinOptions.BuiltinOptions().AddOptions, add_opcode, all_opcodes)
     return add_op
 
+def add_concat_layer(builder, input_tensors, output_tensor, axis,all_tensors, all_opcodes):
+
+    #import pdb; pdb.set_trace()
+    ConcatenationOptions.Start(builder) 
+    ConcatenationOptions.AddAxis(builder, axis)
+    concat_options = ConcatenationOptions.End(builder) 
+    OperatorCode.Start(builder)
+    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().CONCATENATION)
+    concat_opcode = OperatorCode.End(builder)
+    concat_inputs = create_operator_inputs(builder, input_tensors, all_tensors)
+    concat_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
+    concat_op = add_operator(builder, concat_inputs, concat_outputs, concat_options, BuiltinOptions.BuiltinOptions().ConcatenationOptions, concat_opcode, all_opcodes)
+    return concat_op
+
+def add_mul_layer(builder, input_tensor1, input_tensor2, output_tensor, all_tensors, all_opcodes):
+    MulOptions.Start(builder)
+    mul_options = MulOptions.End(builder)
+    OperatorCode.Start(builder)
+    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().MUL)
+    mul_opcode = OperatorCode.End(builder)
+    # Create inputs and outputs
+    mul_inputs = create_operator_inputs(builder, [input_tensor1, input_tensor2], all_tensors)
+    mul_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
+
+    mul_op = add_operator(builder, mul_inputs, mul_outputs, mul_options, BuiltinOptions.BuiltinOptions().MulOptions, mul_opcode, all_opcodes)
+    return mul_op
+
+
 def add_activation_layer(builder, activation_name, input_tensor, output_tensor, all_tensors, all_opcodes):
     # Create the ActivationFunctionType for ReLU
 
@@ -308,6 +337,33 @@ def add_activation_layer(builder, input_tensor, output_tensor,operator_type, all
     act_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
     act_op = add_operator(builder, act_inputs, act_outputs, None, None, act_opcode, all_opcodes)
     return act_op
+
+def add_quant_layer(builder, input_tensor, output_tensor, all_tensors, all_opcodes):
+    # Create the FullyConnectedOptions
+    QuantizeOptions.Start(builder)
+    #TODO - need to deal with fusion here - is here a way to do this?
+    #FullyConnectedOptions.AddFusedActivationFunction(builder, ActivationFunctionType.ActivationFunctionType().RELU)
+    quant_options = QuantizeOptions.End(builder)
+    # Create the OperatorCode for FullyConnected
+    OperatorCode.Start(builder)
+    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().QUANTIZE)
+    quant_opcode = OperatorCode.End(builder)
+    
+    #TODO - ordering here is fragile but important
+
+    quant_inputs = create_operator_inputs(builder, [input_tensor], all_tensors)
+    quant_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
+
+    Operator.Start(builder)
+    Operator.AddOpcodeIndex(builder, 0)
+    Operator.AddInputs(builder, quant_inputs)
+    Operator.AddOutputs(builder, quant_outputs)
+    Operator.AddBuiltinOptions(builder, quant_options)
+    Operator.AddBuiltinOptionsType(builder, BuiltinOptions.BuiltinOptions().QuantizeOptions)
+    quant_op = Operator.End(builder)
+
+    quant_op = add_operator(builder, quant_inputs, quant_outputs, quant_options, BuiltinOptions.BuiltinOptions().QuantizeOptions, quant_opcode, all_opcodes)
+    return quant_op
 
 def add_fc_layer(builder, input_tensor, weight_tensor, bias_tensor, output_tensor,bias_dtype,activation_op, all_tensors, all_opcodes):
     # Create the FullyConnectedOptions

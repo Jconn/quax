@@ -12,11 +12,12 @@ from flax.linen import initializers
 from aqt.jax.v2 import config as aqt_config
 from jax import eval_shape, lax
 from enum import Enum
-from quax.quax_config import OpConfig, quantizer
-from quax.quaxpr import quaxpr_prim, Operation, pytree_fc, quaxpr_default, quaxpr_functional, quaxpr_unquant_prim, AppendedActivation
+from quax.quax_config import OpConfig, quantizer, requantizer
+from quax.quaxpr import quaxpr_prim, Operation, pytree_fc, quaxpr_default, quaxpr_multiarg, quaxpr_functional, quaxpr_unquant_prim, AppendedActivation
 import numpy as np
 from jax.core import ShapedArray
 from flax.linen.dtypes import promote_dtype
+from quax.quax_utils import bits_to_type
 from aqt.jax.v2.aqt_tensor import QTensor
 from jax.interpreters import ad
 from aqt.jax.v2 import aqt_tensor
@@ -35,6 +36,14 @@ from flax.typing import (
   LaxPadding,
   Sequence
 )
+
+model_enroll = None
+def enroll_model(mdl):
+    global model_enroll
+    model_enroll = mdl
+
+def enrolled_model():
+    return model_enroll
 
 def store_quantized(mdl, name, qxtensor):
     init_fn = lambda: 0
@@ -71,7 +80,6 @@ ad.defjvp(marker_p, marker_jvp)
 
 class Quantize(nn.Module):
     bits: int
-    quantized: bool
     op_type: Operation = Operation.QUANTIZE
 
     @nn.compact
@@ -83,14 +91,41 @@ class Quantize(nn.Module):
         out_quantizer = quantizer(self.bits, po2_scaling = False)
        
 
-        qx = quantize(x, calibration_axes=[x for x in range(0, x.ndim)], q = out_quantizer)
+        qx = quantize(x, calibration_axes=[x for x in range(0, x.ndim)], q = out_quantizer, scope = self)
 
         store_quantized(self, 'output', qx)
 
         quaxpr_default(qx, self.op_type,self )
         return qx 
 
-def quantize(x, calibration_axes, q: Quantizer):
+def requantize_op(x, scale):
+    @jax.custom_vjp
+    def requant(x,scale):
+        unquantized = x.x 
+        dtype = bits_to_type(x.bits)
+        x.qx.qvalue = (unquantized / scale[0][0]).astype(dtype)
+        x.qx.scale = scale
+        x.x = x.qx.dequant()
+        return x, x.x 
+
+    def requant_fwd(x,scale):
+        unquantized = x.x 
+        dtype = bits_to_type(x.bits)
+        x.qx.qvalue = (unquantized / scale[0][0]).astype(dtype)
+        x.qx.scale = scale
+        x.x = x.qx.dequant()
+        return (x, x.x), 
+
+    def requant_bwd(res, g):
+        quant_grad = res
+        return quant_grad(g[1])[0],
+
+    requant.defvjp(requant_fwd, requant_bwd)
+    qxt, x = requant(x,scale)
+    #quaxt = QuaxTensor(x = x, qx = qx, bits = q.numerics.bits)
+    return qxt 
+
+def quantize(x, calibration_axes, q: Quantizer, scope):
     @jax.custom_vjp
     def quant(x):
         qx,grad =  q.quant(x, calibration_axes = calibration_axes)
@@ -144,8 +179,95 @@ class QuaxTensor:
     def reshape(self, shape):
         quaxtensor_reshape(shape, self)
         return self
+
     def quantized_tensor(self):
         return self.qx.qvalue
+    
+    def requant(self):
+        pass
+
+    def __add__(self, other):
+        return self._apply_op(other, jnp.add, Operation.ADD)
+
+    def __radd__(self, other):
+        return self.__add__(other)
+
+    def __mul__(self, other):
+        return self._apply_op(other, jnp.multiply, Operation.MUL)
+
+    def __rmul__(self, other):
+        return self.__mul__(other)
+
+    def _apply_op(self, other, op, op_type):
+        op_name = enrolled_model().scope.default_name("op") 
+        enrolled_model().scope.reserve(op_name)
+        op_name = f"element-{op_name}"
+        out_quantizer = quantizer(self.bits, po2_scaling = False)
+        #quaxpr_multiarg(self, other, op_type, enrolled_model(), op_name = op_name)
+        #quaxpr_default(self, op_type, enrolled_model(), t2=other, op_name = op_name)
+        quaxpr_multiarg(self, other, op=op_type, mdl=enrolled_model(), op_name = op_name)
+
+        if isinstance(other, QuaxTensor):
+            new_x = op(self.x, other.x)
+            assert self.bits == other.bits 
+        elif jnp.isscalar(other):
+            new_x = op(self.x, other)
+        else:
+            raise TypeError(f"Unsupported type for operation: {type(other)}")
+        #unquantized output
+        qx = quantize(new_x, calibration_axes=[y for y in range(0, new_x.ndim)], q = out_quantizer, scope = None)
+        #this is the hard part for me
+        #need to store 
+        store_quantized(enrolled_model(), op_name, qx)
+        quaxpr_default(qx, op_type, enrolled_model(), op_name = op_name)
+        return qx
+
+def concatenate(arrays, axis=0):
+    op = Operation.CONCATENATE
+    mdl = enrolled_model()
+    op_name = mdl.scope.default_name("op") 
+    mdl.scope.reserve(op_name)
+    op_name = f"element-{op_name}"
+    #need to check for quantization being equal
+    scales = [x.qx.scale for x in arrays]
+    #TODO - how to requantize things using the same quantization
+    #let this go first because we might insert primitives to requantize
+    #arrays = jax.lax.cond(all(jnp.equal(scales[0][0], x[0]) for x in scales), lambda x: x, lambda arrays: [requantize(x) for x in arrays], arrays)
+    #if not all(jnp.equal(scales[0][0], x[0]) for x in scales):
+    #    arrays = [requantize(x) for x in arrays]
+    #the requantizing here is messy..
+    arrays =[requantize(x, scales[0]) for x in arrays]
+     
+    quaxpr_multiarg(*arrays, op=op, mdl=mdl, axis = axis, op_name=op_name)
+    base_arrs = [x.x for x in arrays]
+    x = jnp.concatenate(base_arrs, axis=axis)
+    out_quantizer = quantizer(arrays[0].bits, po2_scaling = False)
+    qx = quantize(x, calibration_axes=[x for x in range(0, x.ndim)], q = out_quantizer, scope = None)
+    quaxpr_default(qx, op, mdl, axis=axis, op_name=op_name)
+    store_quantized(mdl, op_name, qx)
+
+    return qx
+
+def requantize(qx, scale):
+    op_type = Operation.QUANTIZE
+
+    #TODO - how to capture calibration_axes
+    op_name = enrolled_model().scope.default_name("op") 
+    enrolled_model().scope.reserve(op_name)
+    op_name = f"element-{op_name}"
+    quaxpr_default(qx, op_type, enrolled_model(), op_name = op_name)
+
+    out_quantizer = requantizer(qx.bits,scale, po2_scaling = False)
+   
+
+    qx = quantize(qx.x, calibration_axes=[x for x in range(0, qx.ndim)], q = out_quantizer, scope = None)
+
+    mdl = enrolled_model()
+    store_quantized(mdl, op_name, qx)
+    quaxpr_default(qx, op_type, mdl, op_name = op_name)
+    return qx
+
+
 
 def quaxtensor_reshape(shape, quaxt):
     quaxpr_functional(quaxt, Operation.RESHAPE )
@@ -163,24 +285,19 @@ def quaxtensor_reshape(shape, quaxt):
     return quaxt
 
 def reshape(shape, x):
-    if is_quantized(x):
-        return qtensor_reshape(shape, x) 
     return x.reshape(shape)
 
 def sigmoid(x, out_bits):
-    quantized = is_quantized(x)
-    x = Activation(out_bits, nn.sigmoid, quantized = quantized)(x) 
+    x = Activation(out_bits, nn.sigmoid)(x) 
     return x 
 
 def tanh(x, out_bits):
-    quantized = is_quantized(x)
-    x = Activation(out_bits, nn.tanh, quantized = quantized)(x) 
+    x = Activation(out_bits, nn.tanh)(x) 
     return x 
 
 class Activation(nn.Module):
     lhs_bits: int
     act_fn: nn.activation
-    quantized: bool
     op_type: Operation = Operation.ACTIVATION
 
     @nn.compact
@@ -190,7 +307,7 @@ class Activation(nn.Module):
         quaxpr_default(x, self.op_type,self )
         x = x.dequant()
         x = self.act_fn(x)
-        qx = quantize(x, calibration_axes=[x for x in range(1, x.ndim)], q = out_quantizer)
+        qx = quantize(x, calibration_axes=[x for x in range(1, x.ndim)], q = out_quantizer, scope = self)
         store_quantized(self, 'output', qx)
         quaxpr_default(x, self.op_type,self )
         return x
@@ -235,7 +352,7 @@ class QDense(nn.Module):
         )
 
 
-        kernel = quantize(kernel, calibration_axes = [tmp for tmp in range(0, kernel.ndim)], q = rhs_quantizer)
+        kernel = quantize(kernel, calibration_axes = [tmp for tmp in range(0, kernel.ndim)], q = rhs_quantizer, scope = self)
 
         store_quantized(self, 'kernel', kernel)
 
@@ -243,7 +360,7 @@ class QDense(nn.Module):
           bias = self.param(
             'bias', self.bias_init, (self.features,), self.param_dtype
           )
-          bias = quantize(bias, calibration_axes = [tmp for tmp in range(0, bias.ndim)], q = bias_quantizer)
+          bias = quantize(bias, calibration_axes = [tmp for tmp in range(0, bias.ndim)], q = bias_quantizer, scope = self)
           store_quantized(self, 'bias', bias)
         else:
           bias = None
@@ -262,7 +379,7 @@ class QDense(nn.Module):
         if self.act_fn:
             x = self.act_fn(x)
         
-        qx = quantize(x, calibration_axes=[y for y in range(0, x.ndim)], q = out_quantizer)
+        qx = quantize(x, calibration_axes=[y for y in range(0, x.ndim)], q = out_quantizer, scope = self)
 
         store_quantized(self, 'output', qx)
         quaxpr_default(qx, self.op_type,self, act_fn = map_appended_activation(self.act_fn))
@@ -309,7 +426,6 @@ class QConv(nn.Module):
   kernel_size: int | Sequence[int]
   lhs_bits: int
   rhs_bits: int
-  quantized: bool
   strides: None | int | Sequence[int] = 1
   padding: PaddingLike = 'SAME'
   input_dilation: None | int | Sequence[int] = 1
@@ -483,7 +599,7 @@ class QConv(nn.Module):
 
 
 
-    kernel = quantize(kernel, calibration_axes = [_ for _ in range(0,kernel.ndim-1)], q = rhs_quantizer)
+    kernel = quantize(kernel, calibration_axes = [_ for _ in range(0,kernel.ndim-1)], q = rhs_quantizer , scope = self)
     store_quantized(self, 'kernel', kernel)
 
     if self.use_bias:
@@ -495,7 +611,7 @@ class QConv(nn.Module):
         bias_shape = conv_output_shape[1:]
 
       bias = self.param('bias', self.bias_init, bias_shape, self.param_dtype)
-      bias = quantize(bias, calibration_axes = -1, q = bias_quantizer)
+      bias = quantize(bias, calibration_axes = -1, q = bias_quantizer, scope = self)
 
       store_quantized(self, 'bias', bias)
     else:
@@ -535,7 +651,7 @@ class QConv(nn.Module):
     if self.act_fn:
         y = self.act_fn(y)
 
-    qy = quantize(y, calibration_axes=[x for x in range(0, y.ndim)], q = out_quantizer)
+    qy = quantize(y, calibration_axes=[x for x in range(0, y.ndim)], q = out_quantizer, scope = self)
 
     store_quantized(self, 'output', qy)
 

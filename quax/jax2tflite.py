@@ -8,10 +8,11 @@ from tflite_schema_py_generated import (Model, SubGraph, Tensor, OperatorCode,
 
 from quax.tflite_utils import (get_empty_buffer, add_buffer, add_tensor, 
                             add_empty_tensor, add_tensor_with_buffer, add_fc_layer, add_conv_layer,
-                                add_add_layer, create_subgraph, create_model,create_signature_def,
+                                add_add_layer,add_mul_layer, create_subgraph, create_model,create_signature_def,
                                export_tflite, create_runtime_metadata,create_conversion_metadata, add_reshape_layer, add_relu_layer,add_activation_layer,
-                               add_quantization_params)
+                               add_quantization_params, add_quant_layer)
 import quax.tflite_utils as tflite_utils
+import quax.tflite_utils as tflu 
 import flatbuffers
 from dataclasses import dataclass
 import logging
@@ -78,6 +79,12 @@ class FBB:
         self.handlers[Operation.CONV] = self.conv_handler
         self.handlers[Operation.ACTIVATION] = self.activation_handler
         self.handlers[Operation.RESHAPE] = self.reshape_handler
+        self.handlers[Operation.ADD] = self.add_handler
+        self.handlers[Operation.MUL] = self.mul_handler
+        self.handlers[Operation.CONCATENATE] = self.concat_handler
+
+
+
 
 
     def process_quax_op(self, op, quaxbegin, quaxend):
@@ -163,6 +170,53 @@ class FBB:
             weight_path = weight_path[segment.key]
             quax_path = quax_path[segment.key]
         return weight_path, quax_path
+
+    def make_empty_tensor(self, qxt, shape = None):
+        scale = qxt.qx.scale[0] 
+        zero_point = self.parse_zp(qxt)
+        dtype = bits_to_type(qxt.bits) 
+        if shape is None:
+            shape = qxt.shape
+        out_qparams = add_quantization_params(self.builder, None, None, scale, zero_point, quantized_dim = 0)
+        tensor = add_empty_tensor(self.builder, "activation", shape, self.buffers, quantization_params = out_qparams,dtype=dtype)
+
+        return tensor
+
+    def add_handler(self, quaxbegin, quaxend):
+        #add has two input vars, one output var
+
+        out_qxt = self.get_quaxtensor(quaxbegin, quaxbegin.params['quax_pytree']['op_name'])
+        out_tensor = self.make_empty_tensor(out_qxt) 
+        in_tensors = [self.tensor_act_map[str(x)] for x in quaxbegin.invars]
+        out_var = quaxend.invars[0]
+
+        self.record_activation(out_var, out_tensor)
+
+        op = add_add_layer(self.builder,in_tensors[0], in_tensors[1],out_tensor, all_tensors=self.tensors, all_opcodes=self.opcodes) 
+        self.record_op(op)
+
+    def concat_handler(self, quaxbegin, quaxend):
+        out_var = quaxend.invars[0]
+        out_qxt = self.get_quaxtensor(quaxbegin, quaxbegin.params['quax_pytree']['op_name'])
+        out_tensor = self.make_empty_tensor(out_qxt, shape = out_var.aval.shape) 
+        in_tensors = [self.tensor_act_map[str(x)] for x in quaxbegin.invars]
+        axis = quaxbegin.params['quax_pytree']['axis']
+
+        self.record_activation(out_var, out_tensor)
+        op = tflu.add_concat_layer(self.builder,in_tensors,out_tensor, axis,all_tensors=self.tensors, all_opcodes=self.opcodes) 
+        self.record_op(op)
+
+    def mul_handler(self, quaxbegin, quaxend):
+        out_qxt = self.get_quaxtensor(quaxbegin, quaxbegin.params['quax_pytree']['op_name'])
+        out_tensor = self.make_empty_tensor(out_qxt) 
+        in_tensors = [self.tensor_act_map[str(x)] for x in quaxbegin.invars]
+        out_var = quaxend.invars[0]
+
+        self.record_activation(out_var, out_tensor)
+
+        op = add_mul_layer(self.builder,in_tensors[0], in_tensors[1],out_tensor, all_tensors=self.tensors, all_opcodes=self.opcodes) 
+        self.record_op(op)
+        
 
     def reshape_handler(self, quaxbegin, quaxend):
         #TODO - need to grab the quantization details from the input tensor
@@ -339,20 +393,36 @@ class FBB:
         return out_zp
 
     def quant_handler(self, quaxbegin, quaxend):
-        quaxtensor = self.get_quaxtensor(quaxend, 'output')
+        if 'op_name' in quaxend.params['quax_pytree'].keys():
+            op_name = quaxend.params['quax_pytree']['op_name']
+        else:
+            op_name = 'output'
+
+        quaxtensor = self.get_quaxtensor(quaxend, op_name)
         
         out_dtype = bits_to_type(quaxtensor.bits) 
         out_scale = quaxtensor.qx.scale[0]
         out_zp = self.parse_zp(quaxtensor) 
+        in_var = quaxbegin.invars[0]
         quant_var = quaxend.invars[0]
 
         out_qparams = add_quantization_params(self.builder, None, None, out_scale, out_zp, quantized_dim = 0)
+        #TODO - correct datatype for input tensor
+
+        if str(in_var) in self.tensor_act_map.keys():
+            in_tensor = self.tensor_act_map[str(in_var)]
+        else:
+            in_tensor = add_empty_tensor(self.builder, "activation", quant_var.aval.shape, self.buffers, quantization_params = None, dtype = np.float32)
+        self.record_activation(in_var, in_tensor)
         out_tensor = add_empty_tensor(self.builder, "activation", quant_var.aval.shape, self.buffers, quantization_params = out_qparams, dtype = out_dtype)
+
         self.record_quantization_details(quant_var, (out_qparams, out_dtype) )
         self.record_activation(quant_var, out_tensor)
         #also map the invar to this tensor, because quant is special
-        self.record_activation(quaxbegin.invars[0], out_tensor)
+        #self.record_activation(quaxbegin.invars[0], out_tensor)
         #TODO - add quant op
+        op = add_quant_layer(self.builder,input_tensor=in_tensor,output_tensor=out_tensor, all_tensors=self.tensors, all_opcodes=self.opcodes) 
+        self.record_op(op)
 
     def find_model_io(self, model_jaxpr):
         activation_inputs = []
@@ -470,11 +540,6 @@ class FBB:
         self.record_op(op)
 
     
-    def add_handler(self, eqn):
-        in_tensors = self.process_invars(eqn)
-        out_tensors = self.process_outvars(eqn)
-        op = add_add_layer(self.builder,in_tensors[0], in_tensors[1],out_tensors[0], all_tensors=self.tensors, all_opcodes=self.opcodes) 
-        self.record_op(op)
 
 
 
