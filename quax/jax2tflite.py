@@ -9,7 +9,7 @@ from tflite_schema_py_generated import (Model, SubGraph, Tensor, OperatorCode,
 from quax.tflite_utils import (get_empty_buffer, add_buffer, add_tensor, 
                             add_empty_tensor, add_tensor_with_buffer, add_fc_layer, add_conv_layer,
                                 add_add_layer,add_mul_layer, create_subgraph, create_model,create_signature_def,
-                               export_tflite, create_runtime_metadata,create_conversion_metadata, add_reshape_layer, add_relu_layer,add_activation_layer,
+                               export_tflite, create_runtime_metadata,create_conversion_metadata, add_reshape_layer, add_slice_layer, add_relu_layer,add_activation_layer,
                                add_quantization_params, add_quant_layer)
 import quax.tflite_utils as tflite_utils
 import quax.tflite_utils as tflu 
@@ -34,7 +34,8 @@ def make_quant_params(builder, qxt):
     weight = aqt_weights.qvalue
     weight_scale = aqt_weights.scale[0]
     #TODO - why are we indexing into weight scale
-    dequantized_weights = weight * weight_scale[0]
+    #dequantized_weights = weight * weight_scale[0]
+    dequantized_weights = weight * np.squeeze(weight_scale)
     target_shape = weight_scale.shape
     reduce_axes = tuple(i for i, (d1, d2) in enumerate(zip(dequantized_weights.shape, target_shape)) if d1 != d2)
     weight_mins = jnp.min(dequantized_weights, axis=reduce_axes, keepdims=True)
@@ -79,6 +80,7 @@ class FBB:
         self.handlers[Operation.CONV] = self.conv_handler
         self.handlers[Operation.ACTIVATION] = self.activation_handler
         self.handlers[Operation.RESHAPE] = self.reshape_handler
+        self.handlers[Operation.SLICE] = self.slice_handler
         self.handlers[Operation.ADD] = self.add_handler
         self.handlers[Operation.MUL] = self.mul_handler
         self.handlers[Operation.CONCATENATE] = self.concat_handler
@@ -171,22 +173,23 @@ class FBB:
             quax_path = quax_path[segment.key]
         return weight_path, quax_path
 
-    def make_empty_tensor(self, qxt, shape = None):
+    def make_empty_tensor(self, qxt, out_var):
         scale = qxt.qx.scale[0] 
         zero_point = self.parse_zp(qxt)
         dtype = bits_to_type(qxt.bits) 
-        if shape is None:
-            shape = qxt.shape
+        shape = out_var.aval.shape
         out_qparams = add_quantization_params(self.builder, None, None, scale, zero_point, quantized_dim = 0)
         tensor = add_empty_tensor(self.builder, "activation", shape, self.buffers, quantization_params = out_qparams,dtype=dtype)
 
+        self.record_activation(out_var, tensor)
+        self.record_quantization_details(out_var, (out_qparams, dtype) )
         return tensor
 
     def add_handler(self, quaxbegin, quaxend):
         #add has two input vars, one output var
 
         out_qxt = self.get_quaxtensor(quaxbegin, quaxbegin.params['quax_pytree']['op_name'])
-        out_tensor = self.make_empty_tensor(out_qxt) 
+        out_tensor = self.make_empty_tensor(out_qxt, quaxend.invars[0]) 
         in_tensors = [self.tensor_act_map[str(x)] for x in quaxbegin.invars]
         out_var = quaxend.invars[0]
 
@@ -198,7 +201,7 @@ class FBB:
     def concat_handler(self, quaxbegin, quaxend):
         out_var = quaxend.invars[0]
         out_qxt = self.get_quaxtensor(quaxbegin, quaxbegin.params['quax_pytree']['op_name'])
-        out_tensor = self.make_empty_tensor(out_qxt, shape = out_var.aval.shape) 
+        out_tensor = self.make_empty_tensor(out_qxt,  out_var) 
         in_tensors = [self.tensor_act_map[str(x)] for x in quaxbegin.invars]
         axis = quaxbegin.params['quax_pytree']['axis']
 
@@ -208,7 +211,7 @@ class FBB:
 
     def mul_handler(self, quaxbegin, quaxend):
         out_qxt = self.get_quaxtensor(quaxbegin, quaxbegin.params['quax_pytree']['op_name'])
-        out_tensor = self.make_empty_tensor(out_qxt) 
+        out_tensor = self.make_empty_tensor(out_qxt, quaxend.invars[0]) 
         in_tensors = [self.tensor_act_map[str(x)] for x in quaxbegin.invars]
         out_var = quaxend.invars[0]
 
@@ -218,23 +221,35 @@ class FBB:
         self.record_op(op)
         
 
+    def slice_handler(self, quaxbegin, quaxend):
+        slice_key = quaxend.params['quax_pytree']['slice_key']
+        invar = quaxbegin.invars[0]
+        outvar = quaxend.invars[0]
+        in_tensor = self.get_activation_tensor(invar)
+        input_qparams, input_dtype = self.quant_map[str(invar)]
+        out_tensor = add_empty_tensor(self.builder, "activation", outvar.aval.shape, self.buffers, quantization_params = input_qparams, dtype = input_dtype)
+        self.record_activation(outvar, out_tensor)
+        #let this decide if we are slicing or strided slicing
+        op = add_slice_layer(self.builder, in_tensor, out_tensor, slice_key, self.tensors, self.opcodes, self.buffers) 
+        self.record_op(op)
+
     def reshape_handler(self, quaxbegin, quaxend):
         #TODO - need to grab the quantization details from the input tensor
         invar = quaxbegin.invars[0]
         outvar = quaxend.invars[0]
         in_tensor = self.get_activation_tensor(invar)
 
-        out_tensors = []
         input_qparams, input_dtype = self.quant_map[str(invar)]
         out_tensor = add_empty_tensor(self.builder, "activation", outvar.aval.shape, self.buffers, quantization_params = input_qparams, dtype = input_dtype)
         self.record_activation(outvar, out_tensor)
-        out_tensors.append(out_tensor)
+        self.record_quantization_details(outvar, (input_qparams, input_dtype) )
 
         op = add_reshape_layer(self.builder, in_tensor, out_tensor, outvar.aval.shape, self.tensors, all_opcodes = self.opcodes) 
         self.record_op(op)
 
     def conv_handler(self, quaxbegin, quaxend):
 
+        in_qxt = self.get_quaxtensor(quaxend, 'input')
         out_qxt = self.get_quaxtensor(quaxend, 'output')
         weight_qxt = self.get_quaxtensor(quaxend, 'kernel')
         has_bias = True
@@ -272,24 +287,25 @@ class FBB:
         else:
             raise Exception(f"couldn't find activation tensor with key {act_key}")
         if has_bias:
-            #now we gotta be weird
-            bias_weight = bias_qxt.quantized_tensor()
-            bias_weight = np.array(bias_weight, dtype=bias_dtype)
-            
+            bias_weight = bias_qxt.unquantized_tensor()
+            #need to quantize this to the same scale as our accum
+            #how does one do that - we have the scale of the weight and the input data
+            #multiply the scales together, and quantize the values
+            in_scale = in_qxt.qx.scale[0]
+            weight_scale = weight_qxt.qx.scale[0]
+            bias_scale = np.squeeze(in_scale * weight_scale)
+            bias_weight = np.squeeze(bias_weight)
+
+            new_bias_weight = np.array((bias_weight/bias_scale), dtype=bias_dtype)
+
+            bias_qxt.qx.scale = bias_scale 
+
             bias_qparams = make_quant_params(self.builder, bias_qxt)
-            bias_tensor = add_tensor(self.builder, "bias", bias_weight, self.buffers, quantization_params = bias_qparams, dtype = bias_dtype)
+            bias_tensor = add_tensor(self.builder, "bias", new_bias_weight, self.buffers, quantization_params = bias_qparams, dtype = bias_dtype)
             self.record_weight(bias_tensor)
         
-        out_scale = out_qxt.qx.scale[0] 
-        zero_point = self.parse_zp(out_qxt)
-        out_qparams = add_quantization_params(self.builder, None, None, out_scale, zero_point, quantized_dim = 0)
-        out_tensor = add_empty_tensor(self.builder, "activation", out_var.aval.shape, self.buffers, quantization_params = out_qparams,dtype=out_dtype)
 
-        self.record_activation(in_var, activation_tensor)
-        #TODO - this is a mess..
-        self.record_activation(out_var, out_tensor)
-        self.record_quantization_details(out_var, (out_qparams, out_dtype) )
-        #self.record_weight(weight_var, weight_tensor)
+        out_tensor = self.make_empty_tensor(out_qxt, out_var)
         activation_op = tflite_utils.map_appended_activation(quaxend.params['quax_pytree']['act_fn'])
         #TODO - how to record weight now
         #self.record_weight(bias_var, bias_tensor)
@@ -317,6 +333,7 @@ class FBB:
     
 
         has_bias = True
+        in_qxt = self.get_quaxtensor(quaxend, 'input')
         out_qxt = self.get_quaxtensor(quaxend, 'output')
         weight_qxt = self.get_quaxtensor(quaxend, 'kernel')
         bias_qxt = self.get_quaxtensor(quaxend, 'bias')
@@ -324,7 +341,6 @@ class FBB:
             has_bias = False
             bias_tensor = None
 
-        out_dtype = bits_to_type(out_qxt.bits) 
         weight_dtype = bits_to_type(weight_qxt.bits) 
         bias_dtype = bits_to_type(weight_qxt.bits + out_qxt.bits + 16)
 
@@ -347,12 +363,21 @@ class FBB:
         self.record_weight(weight_tensor)
         
         if has_bias:
-            #now we gotta be weird
-            bias_weight = bias_qxt.quantized_tensor()
-            bias_weight = np.array(bias_weight, dtype=bias_dtype)
+            bias_weight = bias_qxt.unquantized_tensor()
+            #need to quantize this to the same scale as our accum
+            #how does one do that - we have the scale of the weight and the input data
+            #multiply the scales together, and quantize the values
+            in_scale = in_qxt.qx.scale[0]
+            weight_scale = weight_qxt.qx.scale[0]
+            bias_scale = np.squeeze(in_scale * weight_scale)
+            bias_weight = np.squeeze(bias_weight)
+
+            new_bias_weight = np.array((bias_weight/bias_scale), dtype=bias_dtype)
+
+            bias_qxt.qx.scale = [bias_scale]
             
             bias_qparams = make_quant_params(self.builder, bias_qxt)
-            bias_tensor = add_tensor(self.builder, "bias", bias_weight, self.buffers, quantization_params = bias_qparams, dtype = bias_dtype)
+            bias_tensor = add_tensor(self.builder, "bias", new_bias_weight, self.buffers, quantization_params = bias_qparams, dtype = bias_dtype)
             self.record_weight(bias_tensor)
             #TODO -recording weight?
             #self.record_weight(bias_var, bias_tensor)
@@ -360,15 +385,10 @@ class FBB:
         #record the output tensor
 
         #TODO - this is incorrect I thin
-        out_scale = out_qxt.qx.scale[0] 
-        zero_point = self.parse_zp(out_qxt)
-        out_qparams = add_quantization_params(self.builder, None, None, out_scale, zero_point, quantized_dim = 0)
-        out_tensor = add_empty_tensor(self.builder, "activation", out_var.aval.shape, self.buffers, quantization_params = out_qparams,dtype=out_dtype)
+
+        out_tensor = self.make_empty_tensor(out_qxt, out_var) 
 
         self.record_activation(in_var, activation_tensor)
-        #TODO - this is a mess..
-        self.record_activation(out_var, out_tensor)
-        self.record_quantization_details(out_var, (out_qparams, out_dtype) )
 
         #self.record_weight(weight_var, weight_tensor)
         activation_op = tflite_utils.map_appended_activation(quaxend.params['quax_pytree']['act_fn'])
@@ -398,28 +418,20 @@ class FBB:
         else:
             op_name = 'output'
 
-        quaxtensor = self.get_quaxtensor(quaxend, op_name)
+        out_qxt = self.get_quaxtensor(quaxend, op_name)
         
-        out_dtype = bits_to_type(quaxtensor.bits) 
-        out_scale = quaxtensor.qx.scale[0]
-        out_zp = self.parse_zp(quaxtensor) 
         in_var = quaxbegin.invars[0]
         quant_var = quaxend.invars[0]
-
-        out_qparams = add_quantization_params(self.builder, None, None, out_scale, out_zp, quantized_dim = 0)
-        #TODO - correct datatype for input tensor
 
         if str(in_var) in self.tensor_act_map.keys():
             in_tensor = self.tensor_act_map[str(in_var)]
         else:
             in_tensor = add_empty_tensor(self.builder, "activation", quant_var.aval.shape, self.buffers, quantization_params = None, dtype = np.float32)
         self.record_activation(in_var, in_tensor)
-        out_tensor = add_empty_tensor(self.builder, "activation", quant_var.aval.shape, self.buffers, quantization_params = out_qparams, dtype = out_dtype)
 
-        self.record_quantization_details(quant_var, (out_qparams, out_dtype) )
-        self.record_activation(quant_var, out_tensor)
+        out_tensor = self.make_empty_tensor(out_qxt, quaxend.invars[0]) 
+
         #also map the invar to this tensor, because quant is special
-        #self.record_activation(quaxbegin.invars[0], out_tensor)
         #TODO - add quant op
         op = add_quant_layer(self.builder,input_tensor=in_tensor,output_tensor=out_tensor, all_tensors=self.tensors, all_opcodes=self.opcodes) 
         self.record_op(op)
@@ -508,7 +520,9 @@ class FBB:
 
         activation_dtype, weight_dtype, out_dtype, bias_dtype = self.construct_mathy_dtypes(quax_path)
 
+
         out_quantize = weight_path['output']
+
         out_bits = quax_path['bits'][0]['out']
         out_dtype = bits_to_type(out_bits)
 
@@ -520,6 +534,9 @@ class FBB:
 
         self.record_activation(act_eqn.outvars[0], out_tensor)
         self.record_quantization_details(act_eqn.outvars[0], (out_qparams, out_dtype))
+
+        out_tensor = self.make_empty_tensor(out_qxt, shape = quaxend.invars[0].aval.shape) 
+
         def eqn_to_tflite_op(eqn):
             key = eqn.primitive.name
             eqn_map = {}

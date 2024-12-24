@@ -1,4 +1,5 @@
 import jax
+from jax.experimental import checkify
 import jax.numpy as jnp
 from jax import core
 import flax.linen as nn
@@ -171,6 +172,7 @@ class QuaxTensor:
     def bits(self):
         return self.bits.item()
 
+
     def to_np(self):
         np_x = np.array(self.x)
         np_qx = QuaxTensor
@@ -180,11 +182,10 @@ class QuaxTensor:
         quaxtensor_reshape(shape, self)
         return self
 
+    def unquantized_tensor(self):
+        return self.x
     def quantized_tensor(self):
         return self.qx.qvalue
-    
-    def requant(self):
-        pass
 
     def __add__(self, other):
         return self._apply_op(other, jnp.add, Operation.ADD)
@@ -197,6 +198,41 @@ class QuaxTensor:
 
     def __rmul__(self, other):
         return self.__mul__(other)
+
+    def __getitem__(self, key):
+        if isinstance(key, (tuple, slice))  :
+            return self.apply_slice(key)
+        else:
+            raise TypeError("Slicing must use a slice object.")
+
+    def apply_slice(self, key):
+        op_type =  Operation.SLICE
+        op_name = enrolled_model().scope.default_name("op") 
+        mdl = enrolled_model()
+        mdl.scope.reserve(op_name)
+        op_name = f"element-{op_name}"
+        quaxpr_default(self, op_type, mdl, op_name = op_name)
+        orig_shape = self.x.shape
+        self.x = self.x[key]
+        #we can retain the scale i think, since quantization happens on a per activation level
+        self.qx.qvalue = self.qx.qvalue[key]
+        #fix key at this stage
+
+        if isinstance(key, slice):
+            key = (key)
+        new_key = []
+        for dim_idx,sl in enumerate(key):
+            begin, end, idx = sl.start, sl.stop, sl.step
+            if begin is None:
+                begin = 0
+            if end is None:
+                end = orig_shape[dim_idx]
+            if idx is None:
+                idx = 1
+            new_key.append(slice(begin, end, idx))
+
+        quaxpr_default(self, op_type, mdl, op_name = op_name, slice_key = new_key)
+        return self
 
     def _apply_op(self, other, op, op_type):
         op_name = enrolled_model().scope.default_name("op") 
@@ -222,7 +258,7 @@ class QuaxTensor:
         quaxpr_default(qx, op_type, enrolled_model(), op_name = op_name)
         return qx
 
-def concatenate(arrays, axis=0):
+def concatenate(arrays, axis=0, requant=True):
     op = Operation.CONCATENATE
     mdl = enrolled_model()
     op_name = mdl.scope.default_name("op") 
@@ -232,21 +268,31 @@ def concatenate(arrays, axis=0):
     scales = [x.qx.scale for x in arrays]
     #TODO - how to requantize things using the same quantization
     #let this go first because we might insert primitives to requantize
-    #arrays = jax.lax.cond(all(jnp.equal(scales[0][0], x[0]) for x in scales), lambda x: x, lambda arrays: [requantize(x) for x in arrays], arrays)
     #if not all(jnp.equal(scales[0][0], x[0]) for x in scales):
     #    arrays = [requantize(x) for x in arrays]
     #the requantizing here is messy..
-    arrays =[requantize(x, scales[0]) for x in arrays]
-     
+    def nearly_equal(x, y):
+        return jnp.array(jnp.abs(x[0] - y[0]) < .0001)
+    if not requant:
+        #checkify.check(jnp.all(jnp.array([nearly_equal(scales[0],x) for x in scales])), "scales aren't equal in requant")
+        assert all([scales[0]== x for x in scales])
+    if requant:
+        arrays = [arrays[0]] + [requantize(x, scales[0]) for x in arrays[1:]]
+
     quaxpr_multiarg(*arrays, op=op, mdl=mdl, axis = axis, op_name=op_name)
     base_arrs = [x.x for x in arrays]
-    x = jnp.concatenate(base_arrs, axis=axis)
-    out_quantizer = quantizer(arrays[0].bits, po2_scaling = False)
-    qx = quantize(x, calibration_axes=[x for x in range(0, x.ndim)], q = out_quantizer, scope = None)
-    quaxpr_default(qx, op, mdl, axis=axis, op_name=op_name)
-    store_quantized(mdl, op_name, qx)
+    qval_arrs = [x.qx.qvalue for x in arrays]
 
-    return qx
+    x = jnp.concatenate(base_arrs, axis=axis)
+    qval = jnp.concatenate(qval_arrs, axis=axis)
+    tmp = arrays[0]
+    qx = QTensor(qvalue= qval, scale=tmp.qx.scale,scale_t = tmp.qx.scale_t, dequant_dtype = tmp.qx.dequant_dtype, bias=tmp.qx.bias)
+    qxt = QuaxTensor(x = x, qx = qx, bits= tmp.bits) 
+    
+    quaxpr_default(qxt, op, mdl, axis=axis, op_name=op_name)
+    store_quantized(mdl, op_name, qxt)
+
+    return qxt
 
 def requantize(qx, scale):
     op_type = Operation.QUANTIZE
@@ -344,6 +390,7 @@ class QDense(nn.Module):
         #TODO - assignment means here
 
         #x = x.dequant()
+        store_quantized(self, 'input', x)
         kernel = self.param(
           'kernel',
           self.kernel_init,
@@ -618,6 +665,7 @@ class QConv(nn.Module):
       bias = None
 
 
+    store_quantized(self, 'input', x)
     #inputs, kernel, bias = promote_dtype(inputs, kernel, bias, dtype=self.dtype)
     if self.shared_weights:
       y = lax.conv_general_dilated(

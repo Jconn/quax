@@ -49,8 +49,8 @@ class CNN(nn.Module):
     def __call__(self, x):
         enroll_model(self)
         act_bits = 16 
-        weight_bits = 4
-        bias = False 
+        weight_bits = 8
+        bias = True 
         #x = Quantize(bits=act_bits, quantized = self.quantized)(x)
         #x = QConv(features=32, kernel_size=(3, 3), lhs_bits = act_bits, rhs_bits = weight_bits, quantized= self.quantized, act_fn = nn.relu, use_bias = bias)(x)
         #x = QConv(features=64, kernel_size=(3, 3), lhs_bits = act_bits, rhs_bits = weight_bits,quantized=self.quantized, act_fn = nn.relu, use_bias = bias)(x)
@@ -62,16 +62,18 @@ class CNN(nn.Module):
 
         use_running_avg = False
         x = Quantize(bits=act_bits)(x)
-        x = QConv(features=32, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
-        x = QConv(features=64, kernel_size=(3, 3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True)(x)
+        #x = QConv(features=32, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+        x = QConv(features=16, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
         x = x.reshape((x.shape[0], -1))
-        x = QDense(features=512,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
+        #x = QDense(features=512,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
+        x = x[:,100:]
+        x = quax.concatenate([x,x], axis=1, requant=False)
         x = QDense(features=256,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
         y = QDense(features=256,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
         x = x + y
-        x = x * y 
-        x = quax.concatenate([x,y,x], axis=1)
-        x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = False)(x)
+        #x = x * y 
+        x = quax.concatenate([x,y], axis=1)
+        x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias)(x)
         return x.x
 
 @functools.partial(jax.jit, static_argnums=(3,))
@@ -137,7 +139,8 @@ def train_epoch(state, train_ds, batch_size, rng):
     state = update_model(state, grads, updated_var)
     epoch_loss.append(loss)
     epoch_accuracy.append(accuracy)
-    break
+    #jc - test early exit
+    #break
 
   train_loss = np.mean(epoch_loss)
   train_accuracy = np.mean(epoch_accuracy)
@@ -415,11 +418,14 @@ def test_translate(tflite_model, state, weight_only: bool = True):
   one_hot = jax.nn.one_hot(sample_label, 10)
 
 
+  
   mlogits, updated_var = state.cnn_train.apply(state.model,sample_image,rngs={'params': jax.random.PRNGKey(0)},mutable=True,)
   tfl_loss = jnp.mean(optax.softmax_cross_entropy(logits=out_logs, labels=one_hot))
   jax_loss = jnp.mean(optax.softmax_cross_entropy(logits=mlogits, labels=one_hot))
   if jnp.abs(jax_loss - tfl_loss) > .05:
       raise Exception(f"tflite jax loss differs - tfl; {tfl_loss}, jax - {jax_loss}")
+  else:
+      print(f"tflite jax PASS - tfl; {tfl_loss}, jax - {jax_loss}")
 
 def tflite_invoke(interpreter, float_input):
     interpreter.allocate_tensors()
@@ -437,7 +443,8 @@ def tflite_invoke(interpreter, float_input):
     scale, zero_point = quantization_params
 
     # Quantize the float input to int16
-    quantized_input = np.round(float_input / scale + zero_point).astype(np.int16)
+    #quantized_input = np.round(float_input / scale + zero_point).astype(np.int16)
+    quantized_input = float_input
 
     # Ensure the input tensor matches the expected type and shape
     #interpreter.set_tensor(0,input_index)
@@ -460,11 +467,12 @@ def main(argv):
 
   # 1. TRAIN.
   state = train_and_evaluate(
-      num_epochs=1, workdir='/tmp/aqt_mnist_example')
+      num_epochs=3, workdir='/tmp/aqt_mnist_example')
 
   x = jnp.ones([1, 28, 28, 1])
   converter = FBB()
-  tflite = converter.convert(state.cnn_train, state.model, x)
+  with jax.disable_jit():
+      tflite = converter.convert(state.cnn_train, state.model, x)
   with open('mnist_quax.tflite', 'wb') as f:
       f.write(tflite)
 

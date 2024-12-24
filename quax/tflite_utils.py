@@ -6,7 +6,7 @@ from tflite_schema_py_generated import (Model, SubGraph, Tensor, OperatorCode,
                                         Buffer, Operator, BuiltinOperator, 
                                         BuiltinOptions, FullyConnectedOptions,ConcatenationOptions,
                                         ActivationFunctionType, AddOptions, MulOptions, TensorMap,
-                                        SignatureDef, Metadata, QuantizationParameters, ReshapeOptions, TensorType, Conv2DOptions,ActivationFunctionType, Padding, QuantizeOptions)
+                                        SignatureDef, Metadata, QuantizationParameters, ReshapeOptions, TensorType, Conv2DOptions,ActivationFunctionType, Padding, QuantizeOptions, StridedSliceOptions, SliceOptions)
 
 from enum import Enum
 import jax.numpy as jnp
@@ -202,7 +202,6 @@ def add_add_layer(builder, input_tensor1, input_tensor2, output_tensor, all_tens
 
 def add_concat_layer(builder, input_tensors, output_tensor, axis,all_tensors, all_opcodes):
 
-    #import pdb; pdb.set_trace()
     ConcatenationOptions.Start(builder) 
     ConcatenationOptions.AddAxis(builder, axis)
     concat_options = ConcatenationOptions.End(builder) 
@@ -266,6 +265,79 @@ def add_relu_layer(builder, input_tensor, output_tensor, all_tensors, all_opcode
 
     relu_op = add_operator(builder, relu_inputs, relu_outputs, None, None, relu_opcode, all_opcodes)
     return relu_op
+
+
+def add_slice_layer(builder, input_tensor, output_tensor, slicing_key, all_tensors, all_opcodes, all_buffers):
+    """
+    Adds a StridedSlice operator to the TFLite flatbuffer model.
+    
+    Args:
+        builder: FlatBufferBuilder for constructing the TFLite model.
+        input_tensor: Input tensor index.
+        output_tensor: Output tensor index.
+        slicing_key: Dictionary specifying 'begin', 'end', and 'stride' for each dimension.
+                     Example: {'begin': [0, 0, 2], 'end': [1, 193, 10], 'stride': [1, 1, 1]}
+        all_tensors: List of all tensors in the model.
+        all_opcodes: List of all operator codes in the model.
+    Returns:
+        The created StridedSlice operator.
+    """
+    # Extract slicing parameters
+    begin = []
+    end = []
+    strides = []
+    begin_mask = 0
+    end_mask = 0
+
+    for i, s in enumerate(slicing_key):
+        if isinstance(s, slice):
+            # Handle `slice(start, stop, stride)`
+            begin.append(0 if s.start is None else s.start)
+            end.append(0 if s.stop is None else s.stop)
+            strides.append(1 if s.step is None else s.step)
+            
+            # Adjust masks for None (default slicing)
+            if s.start is None:
+                begin_mask |= (1 << i)  # Ignore the begin value for this dimension
+            if s.stop is None:
+                end_mask |= (1 << i)    # Ignore the end value for this dimension
+        else:
+            raise ValueError(f"Unsupported slicing type {type(s)} at dimension {i}")
+
+    # Create the `begin`, `end`, and `stride` tensors 
+    op_inputs = [input_tensor]
+    for idx,stride_elem in enumerate((begin, end, strides)):
+        dtype = np.int32
+        np_arr = np.array(stride_elem, dtype=dtype)
+        in_tensor = add_tensor(builder, f"stride_{idx}", np_arr, all_buffers, dtype=dtype)
+        op_inputs.append(in_tensor)
+        #TODO - a little messy to do things this way decentralized tensor accumulation
+        all_tensors.append(in_tensor)
+
+    # Configure the options
+    StridedSliceOptions.StridedSliceOptionsStart(builder)
+    StridedSliceOptions.StridedSliceOptionsAddBeginMask(builder, 0)  # Customize as needed
+    StridedSliceOptions.StridedSliceOptionsAddEndMask(builder, 0)    # Customize as needed
+    StridedSliceOptions.StridedSliceOptionsAddEllipsisMask(builder, 0)
+    StridedSliceOptions.StridedSliceOptionsAddNewAxisMask(builder, 0)
+    StridedSliceOptions.StridedSliceOptionsAddShrinkAxisMask(builder, 0)
+    strided_slice_options = StridedSliceOptions.StridedSliceOptionsEnd(builder)
+
+    # Create the OperatorCode for StridedSlice
+    OperatorCode.Start(builder)
+    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().STRIDED_SLICE)
+    strided_slice_opcode = OperatorCode.End(builder)
+
+    # Create inputs and outputs
+    strided_slice_inputs = create_operator_inputs(builder, op_inputs, all_tensors)
+    strided_slice_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
+
+    # Add the StridedSlice operator
+    strided_slice_op = add_operator(builder, strided_slice_inputs, strided_slice_outputs, 
+                                    strided_slice_options, BuiltinOptions.BuiltinOptions().StridedSliceOptions, 
+                                    strided_slice_opcode, all_opcodes)
+
+    return strided_slice_op
 
 def add_reshape_layer(builder, input_tensor, output_tensor, new_shape, all_tensors, all_opcodes):
     # Create the ReshapeOptions

@@ -23,19 +23,44 @@ from aqt.jax.v2.aqt_dot_general import DotGeneral
 from aqt.jax.v2.aqt_tensor import QTensor
 from aqt.jax.v2.aqt_dot_general import MultiTensor 
 from aqt.jax.v2 import aqt_tensor
+from aqt.jax.v2.calibration import Calibration 
 from quax import aqt_quax
+
+@aqt_utils.flax_slots_kw_only_dataclass
+class InheritedCalbration(Calibration):
+  """Calibration with a constant per-tensor or per-channel value."""
+
+  scale: jnp.ndarray | float
+  bias: None | jnp.ndarray | float = None
+
+  def get_scale_and_bias(
+      self,
+      x: jnp.ndarray,
+      shared_axes,
+      numerics_,
+      context,
+  ) -> tuple[list[jnp.ndarray], list[jnp.ndarray]]:
+    dtype = self.dtype if self.dtype is not None else x.dtype
+    if self.bias is None:
+      bias = []
+    elif jnp.isscalar(self.bias) or isinstance(self.bias, float):
+      # floats are scalars, but pytype can't infer that.
+      bias = [jnp.full(x.shape, self.bias, x.dtype)]
+    else:
+      bias = [self.bias.astype(dtype)]
+    return [self.scale.astype(dtype)], bias
+
 
 
 def requantizer(bits, scale, po2_scaling = False):
     #TODO - how to deal with context
     dtype = bits_to_type(bits)
-    scale = scale[0][0]
-    bound = (1.0/scale).astype(dtype)
+    scale = scale[0]
     #TODO bias
     quant_calib = functools.partial(
-        calibration.ConstantCalibration,
+        InheritedCalbration,
         po2_scale=po2_scaling,
-        bound =bound 
+        scale =scale 
     )
     quant = Quantizer(
         numerics=int_numerics.IntSymmetric(

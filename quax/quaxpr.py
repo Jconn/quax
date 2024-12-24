@@ -15,6 +15,7 @@ class Operation(Enum):
     ADD = 7
     MUL = 8
     CONCATENATE = 9
+    SLICE = 10
 
 class AppendedActivation(Enum):
     RELU = 0
