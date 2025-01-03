@@ -10,7 +10,7 @@ from quax.tflite_utils import (get_empty_buffer, add_buffer, add_tensor,
                             add_empty_tensor, add_tensor_with_buffer, add_fc_layer, add_conv_layer,
                                 add_add_layer,add_mul_layer, create_subgraph, create_model,create_signature_def,
                                export_tflite, create_runtime_metadata,create_conversion_metadata, add_reshape_layer, add_slice_layer, add_relu_layer,add_activation_layer,
-                               add_quantization_params, add_quant_layer)
+                               add_quantization_params, add_quant_layer, add_dequant_layer)
 import quax.tflite_utils as tflite_utils
 import quax.tflite_utils as tflu 
 import flatbuffers
@@ -77,6 +77,7 @@ class FBB:
         self.weight_buffer_map = {}
         self.handlers[Operation.FC] = self.fc_handler
         self.handlers[Operation.QUANTIZE] = self.quant_handler
+        self.handlers[Operation.DEQUANTIZE] = self.dequant_handler
         self.handlers[Operation.CONV] = self.conv_handler
         self.handlers[Operation.ACTIVATION] = self.activation_handler
         self.handlers[Operation.RESHAPE] = self.reshape_handler
@@ -229,6 +230,7 @@ class FBB:
         input_qparams, input_dtype = self.quant_map[str(invar)]
         out_tensor = add_empty_tensor(self.builder, "activation", outvar.aval.shape, self.buffers, quantization_params = input_qparams, dtype = input_dtype)
         self.record_activation(outvar, out_tensor)
+        self.record_quantization_details(outvar, (input_qparams, input_dtype) )
         #let this decide if we are slicing or strided slicing
         op = add_slice_layer(self.builder, in_tensor, out_tensor, slice_key, self.tensors, self.opcodes, self.buffers) 
         self.record_op(op)
@@ -411,6 +413,32 @@ class FBB:
         out_scale = quaxtensor.qx.scale[0]
         out_zp = jnp.zeros(out_scale.shape, dtype=np.int32)
         return out_zp
+
+    def dequant_handler(self, quaxbegin, quaxend):
+        if 'op_name' in quaxend.params['quax_pytree'].keys():
+            op_name = quaxend.params['quax_pytree']['op_name']
+        else:
+            op_name = 'input'
+
+        in_qxt = self.get_quaxtensor(quaxbegin, op_name)
+        
+        quant_var = quaxbegin.invars[0]
+        dequant_var = quaxend.invars[0]
+
+        if str(quant_var) in self.tensor_act_map.keys():
+            in_tensor = self.tensor_act_map[str(quant_var)]
+        else:
+            in_tensor = self.make_empty_tensor(in_qxt, quaxbegin.invars[0]) 
+
+
+        out_tensor = add_empty_tensor(self.builder, "activation", dequant_var.aval.shape, self.buffers, quantization_params = None, dtype = np.float32)
+        self.record_activation(dequant_var, out_tensor)
+
+
+        #also map the invar to this tensor, because quant is special
+        #TODO - add quant op
+        op = add_dequant_layer(self.builder,input_tensor=in_tensor,output_tensor=out_tensor, all_tensors=self.tensors, all_opcodes=self.opcodes) 
+        self.record_op(op)
 
     def quant_handler(self, quaxbegin, quaxend):
         if 'op_name' in quaxend.params['quax_pytree'].keys():

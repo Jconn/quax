@@ -16,6 +16,7 @@ class Operation(Enum):
     MUL = 8
     CONCATENATE = 9
     SLICE = 10
+    DEQUANTIZE = 11
 
 class AppendedActivation(Enum):
     RELU = 0

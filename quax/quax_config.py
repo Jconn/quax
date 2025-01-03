@@ -33,7 +33,7 @@ class InheritedCalbration(Calibration):
   scale: jnp.ndarray | float
   bias: None | jnp.ndarray | float = None
 
-  def get_scale_and_bias(
+  def get_scale_and_bias_and_sparsity(
       self,
       x: jnp.ndarray,
       shared_axes,
@@ -48,7 +48,8 @@ class InheritedCalbration(Calibration):
       bias = [jnp.full(x.shape, self.bias, x.dtype)]
     else:
       bias = [self.bias.astype(dtype)]
-    return [self.scale.astype(dtype)], bias
+    #sparsity now i guess..
+    return [self.scale.astype(dtype)], bias, None
 
 
 

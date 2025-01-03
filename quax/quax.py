@@ -78,6 +78,23 @@ def marker_jvp(primals, tangents, **params):
 
 ad.defjvp(marker_p, marker_jvp)
 
+class Dequantize(nn.Module):
+    '''
+    this takes as input a quaxtensor
+    returns a numpy tensor
+    '''
+    op_type: Operation = Operation.DEQUANTIZE
+
+    @nn.compact
+    def __call__(self, qx):
+        quax_pytree = {}
+        quax_pytree['op'] = self.op_type
+        #this is unquantized, so we can't use the default quaxpr gen here
+        store_quantized(self, 'input', qx)
+        quaxpr_default(qx, self.op_type,self )
+        x = qx.x
+        quaxpr_unquant_prim(x, quax_pytree)
+        return x 
 
 class Quantize(nn.Module):
     bits: int
@@ -220,7 +237,22 @@ class QuaxTensor:
 
         if isinstance(key, slice):
             key = (key)
+
+
+        #great can only have one ellipsis
         new_key = []
+        for idx, kval in enumerate(key):
+            if isinstance(kval, type(Ellipsis)):
+                num_dims = len(orig_shape)
+                ellipse_fill = num_dims - (len(key) - 1) #do not count ellipse in the key size
+                for i in range(ellipse_fill):
+                    new_key.append(slice(None,None,None))
+
+            else:
+                new_key.append(kval)
+        key = new_key
+        new_key = []
+
         for dim_idx,sl in enumerate(key):
             begin, end, idx = sl.start, sl.stop, sl.step
             if begin is None:

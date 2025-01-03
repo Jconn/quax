@@ -6,7 +6,7 @@ from tflite_schema_py_generated import (Model, SubGraph, Tensor, OperatorCode,
                                         Buffer, Operator, BuiltinOperator, 
                                         BuiltinOptions, FullyConnectedOptions,ConcatenationOptions,
                                         ActivationFunctionType, AddOptions, MulOptions, TensorMap,
-                                        SignatureDef, Metadata, QuantizationParameters, ReshapeOptions, TensorType, Conv2DOptions,ActivationFunctionType, Padding, QuantizeOptions, StridedSliceOptions, SliceOptions)
+                                        SignatureDef, Metadata, QuantizationParameters, ReshapeOptions, TensorType, Conv2DOptions,ActivationFunctionType, Padding, QuantizeOptions, StridedSliceOptions, SliceOptions, DequantizeOptions)
 
 from enum import Enum
 import jax.numpy as jnp
@@ -410,6 +410,29 @@ def add_activation_layer(builder, input_tensor, output_tensor,operator_type, all
     act_op = add_operator(builder, act_inputs, act_outputs, None, None, act_opcode, all_opcodes)
     return act_op
 
+def add_dequant_layer(builder, input_tensor, output_tensor, all_tensors, all_opcodes):
+    # Create the FullyConnectedOptions
+    DequantizeOptions.Start(builder)
+    dequant_options = DequantizeOptions.End(builder)
+    # Create the OperatorCode for FullyConnected
+    OperatorCode.Start(builder)
+    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().DEQUANTIZE)
+    quant_opcode = OperatorCode.End(builder)
+    
+    #TODO - ordering here is fragile but important
+
+    dequant_inputs = create_operator_inputs(builder, [input_tensor], all_tensors)
+    dequant_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
+
+    #Operator.Start(builder)
+    #Operator.AddOpcodeIndex(builder, 0)
+    #Operator.AddInputs(builder, dequant_inputs)
+    #Operator.AddOutputs(builder, dequant_outputs)
+    #Operator.AddBuiltinOptions(builder, dequant_options)
+    #Operator.AddBuiltinOptionsType(builder, BuiltinOptions.BuiltinOptions().DequantizeOptions)
+
+    dequant_op = add_operator(builder, dequant_inputs, dequant_outputs, dequant_options, BuiltinOptions.BuiltinOptions().DequantizeOptions, quant_opcode, all_opcodes)
+    return dequant_op
 def add_quant_layer(builder, input_tensor, output_tensor, all_tensors, all_opcodes):
     # Create the FullyConnectedOptions
     QuantizeOptions.Start(builder)

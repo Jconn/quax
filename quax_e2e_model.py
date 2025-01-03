@@ -13,8 +13,8 @@
 # limitations under the License.
 """Mnist example."""
 import os
-os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
-os.environ['CUDA_VISIBLE_DEVICES'] = "-1" 
+#os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
+#os.environ['CUDA_VISIBLE_DEVICES'] = "-1" 
 import copy
 import functools
 import sys
@@ -41,7 +41,7 @@ from jax.experimental import jax2tf
 import tensorflow as tf
 
 from quax.jax2tflite import FBB
-from quax.quax import QDense, Quantize, QConv, enroll_model
+from quax.quax import QDense, Quantize, QConv, enroll_model, Dequantize
 from quax import quax
 
 class CNN(nn.Module):
@@ -61,9 +61,18 @@ class CNN(nn.Module):
         #    x = x.dequant()
 
         use_running_avg = False
+        #x = QConv(features=2, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+        #x = nn.Conv(features=32, kernel_size=(3,3), use_bias = True, padding='VALID')(x)
+        #x = nn.relu(x)
+        #x = x.reshape(x.shape[0], -1)
+        #x = nn.Dense(features=256, use_bias = bias)(x)
+        #x = nn.Dense(features=256, use_bias = bias)(x)
+        #x = nn.relu(x)
+        #x = nn.Dense(features=10, use_bias = bias)(x)
         x = Quantize(bits=act_bits)(x)
-        #x = QConv(features=32, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
-        x = QConv(features=16, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+        x = QConv(features=32, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+
+        x = x[...,:8]
         x = x.reshape((x.shape[0], -1))
         #x = QDense(features=512,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
         x = x[:,100:]
@@ -74,7 +83,8 @@ class CNN(nn.Module):
         #x = x * y 
         x = quax.concatenate([x,y], axis=1)
         x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias)(x)
-        return x.x
+        x = Dequantize()(x)
+        return x
 
 @functools.partial(jax.jit, static_argnums=(3,))
 def apply_model(model_params, images, labels, apply_fn):
@@ -208,12 +218,15 @@ def train_and_evaluate(
   batch_size = 128
   for epoch in range(1, num_epochs + 1):
     rng, input_rng = jax.random.split(rng)
+
     state, train_loss, train_accuracy = train_epoch(
         state, train_ds, batch_size, input_rng
     )
-    _, test_loss, test_accuracy, _ = apply_model(
-        state.model, test_ds['image'], test_ds['label'], state.cnn_eval.apply
-    )
+    #_, test_loss, test_accuracy, _ = apply_model(
+    #    state.model, test_ds['image'], test_ds['label'], state.cnn_eval.apply
+    #)
+    test_loss = 0.
+    test_accuracy = 0.
 
     print(
         'epoch:% 3d, train_loss: %.30f, train_accuracy: %.30f, test_loss:'
@@ -466,6 +479,7 @@ def main(argv):
   del argv
 
   # 1. TRAIN.
+
   state = train_and_evaluate(
       num_epochs=3, workdir='/tmp/aqt_mnist_example')
 
