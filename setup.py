@@ -6,7 +6,7 @@ import subprocess
 class BuildWithFlatc(build_py):
     def run(self):
         # Run flatc command before building
-        subprocess.check_call(["flatc", "--python", "schema_v3.fbs"])
+        subprocess.check_call(["flatc", "--python", "schema_v3c.fbs"])
         #move to quax
         if os.path.exists("quax/tflite"):
             subprocess.check_call(["rm", "quax/tflite", "-r"])

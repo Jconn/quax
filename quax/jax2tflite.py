@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from jax.tree_util import tree_flatten
-from tflite_schema_py_generated import (Model, SubGraph, Tensor, OperatorCode,
+from quax.tflite import (Model, SubGraph, Tensor, OperatorCode,
                                         Buffer, Operator, BuiltinOperator, 
                                         BuiltinOptions, FullyConnectedOptions,
                                         ActivationFunctionType, ActivationFunctionType)

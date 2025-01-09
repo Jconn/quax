@@ -1,8 +1,8 @@
 import flatbuffers
 import numpy as np
 # Assuming the flatbuffer schema files have been generated and are available in your path
-import tflite_schema_py_generated as tfl
-from tflite_schema_py_generated import (Model, SubGraph, Tensor, OperatorCode,
+import quax.tflite as tfl
+from quax.tflite import (Model, SubGraph, Tensor, OperatorCode,
                                         Buffer, Operator, BuiltinOperator, 
                                         BuiltinOptions, FullyConnectedOptions,ConcatenationOptions,
                                         ActivationFunctionType, AddOptions, MulOptions, TensorMap,
@@ -365,8 +365,6 @@ def add_reshape_layer(builder, input_tensor, output_tensor, new_shape, all_tenso
 def add_conv_layer(builder, input_tensor, weight_tensor, bias_tensor, output_tensor,bias_dtype,activation_op, all_tensors, all_opcodes,quax_params):
     Conv2DOptions.Start(builder)
     #TODO - need to deal with fusion here - is here a way to do this?
-    if bias_tensor:
-        Conv2DOptions.AddQuantizedBiasType(builder, map_tensor_type(bias_dtype))
     #TODO - conv stride options
     Conv2DOptions.AddStrideH(builder, 1)
     Conv2DOptions.AddStrideW(builder, 1)
@@ -465,7 +463,6 @@ def add_fc_layer(builder, input_tensor, weight_tensor, bias_tensor, output_tenso
     FullyConnectedOptions.Start(builder)
     #TODO - need to deal with fusion here - is here a way to do this?
     #FullyConnectedOptions.AddFusedActivationFunction(builder, ActivationFunctionType.ActivationFunctionType().RELU)
-    FullyConnectedOptions.AddQuantizedBiasType(builder, map_tensor_type(bias_dtype))
     FullyConnectedOptions.AddFusedActivationFunction(builder,activation_op)
     fc_options = FullyConnectedOptions.End(builder)
     # Create the OperatorCode for FullyConnected
