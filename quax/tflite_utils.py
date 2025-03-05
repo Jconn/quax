@@ -62,7 +62,6 @@ def add_quantization_params(builder, mins, maxs, scale, zero_point, quantized_di
             return builder.CreateNumpyVector(np.ravel(x) )
         return None
     zero_point = np.array(zero_point, dtype=np.int64)
-    print(f"{scale.shape}, {zero_point.shape}")
     mins = to_vec(mins) 
     maxs = to_vec(maxs)
     scale = to_vec(scale) 
@@ -187,17 +186,17 @@ def add_operator(builder, inputs, outputs, options,options_type, opcode, all_opc
     op = Operator.End(builder)
     return op
 
-def add_add_layer(builder, input_tensor1, input_tensor2, output_tensor, all_tensors, all_opcodes):
-    AddOptions.Start(builder)
-    add_options = AddOptions.End(builder)
+def add_vec_layer(builder, input_tensor1, input_tensor2, output_tensor,vec_op, all_tensors, all_opcodes):
+    options = None 
+    vec_options = None
     OperatorCode.Start(builder)
-    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().ADD)
+    OperatorCode.AddBuiltinCode(builder, vec_op)
     add_opcode = OperatorCode.End(builder)
     # Create inputs and outputs
-    add_inputs = create_operator_inputs(builder, [input_tensor1, input_tensor2], all_tensors)
-    add_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
+    inputs = create_operator_inputs(builder, [input_tensor1, input_tensor2], all_tensors)
+    outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
 
-    add_op = add_operator(builder, add_inputs, add_outputs, add_options, BuiltinOptions.BuiltinOptions().AddOptions, add_opcode, all_opcodes)
+    add_op = add_operator(builder, inputs, outputs, options, vec_options, add_opcode, all_opcodes)
     return add_op
 
 def add_concat_layer(builder, input_tensors, output_tensor, axis,all_tensors, all_opcodes):
@@ -225,31 +224,6 @@ def add_mul_layer(builder, input_tensor1, input_tensor2, output_tensor, all_tens
 
     mul_op = add_operator(builder, mul_inputs, mul_outputs, mul_options, BuiltinOptions.BuiltinOptions().MulOptions, mul_opcode, all_opcodes)
     return mul_op
-
-
-def add_activation_layer(builder, activation_name, input_tensor, output_tensor, all_tensors, all_opcodes):
-    # Create the ActivationFunctionType for ReLU
-
-    # Create the OperatorCode for ReLU
-    activation_map = {}
-    activation_map['relu'] = BuiltinOperator.BuiltinOperator().RELU
-    activation_map['tanh'] = BuiltinOperator.BuiltinOperator().TANH
-    activation_map['sigmoid'] = BuiltinOperator.BuiltinOperator().LOGISTIC
-
-
-    OperatorCode.Start(builder)
-
-
-    OperatorCode.AddBuiltinCode(builder, activation_map[activation_name])
-    act_fn_opcode = OperatorCode.End(builder)
-    
-    # Create inputs and outputs
-    act_fn_inputs = create_operator_inputs(builder, [input_tensor], all_tensors)
-    act_fn_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
-
-    act_fn_op = add_operator(builder, act_fn_inputs, act_fn_outputs, None, None, act_fn_opcode, all_opcodes)
-
-    return act_fn_op
 
 def add_relu_layer(builder, input_tensor, output_tensor, all_tensors, all_opcodes):
     # Create the ActivationFunctionType for ReLU
@@ -338,6 +312,18 @@ def add_slice_layer(builder, input_tensor, output_tensor, slicing_key, all_tenso
                                     strided_slice_opcode, all_opcodes)
 
     return strided_slice_op
+
+def add_transpose_layer(builder, input_tensor, output_tensor, new_shape, all_tensors, all_opcodes):
+    OperatorCode.Start(builder)
+    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().TRANSPOSE)
+    transpose_opcode = OperatorCode.End(builder)
+    
+    # Create inputs and outputs
+    transpose_inputs = create_operator_inputs(builder, [input_tensor], all_tensors)
+    transpose_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
+
+    transpose_op = add_operator(builder, transpose_inputs, transpose_outputs, None, None, transpose_opcode, all_opcodes)
+    return transpose_op
 
 def add_reshape_layer(builder, input_tensor, output_tensor, new_shape, all_tensors, all_opcodes):
     # Create the ReshapeOptions
@@ -491,8 +477,8 @@ def create_signature_def(builder, input_tensors, output_tensors, all_tensors, su
     # Create TensorMaps for inputs
     signature_key = builder.CreateString("serving_default")
     input_maps = []
-    for tensor in input_tensors:
-        name = "input"
+    for idx, tensor in enumerate(input_tensors):
+        name = f"input-{idx}"
         name_offset = builder.CreateString(name)
         TensorMap.TensorMapStart(builder)
         TensorMap.TensorMapAddName(builder, name_offset)
@@ -584,7 +570,7 @@ def create_operator_outputs(builder, output_tensors, all_tensors):
 
 
 def create_subgraph_inputs(builder, input_tensors, all_tensors):
-    SubGraph.StartInputsVector(builder, 1)
+    SubGraph.StartInputsVector(builder, len(input_tensors))
     for itensor in reversed(input_tensors):
         builder.PrependInt32(all_tensors.index(itensor))  # input tensor index
     subgraph_inputs = builder.EndVector()
@@ -755,8 +741,3 @@ def map_jax_to_tflite_op(jax_primitive):
     
     # If no mapping is found
     raise ValueError(f"Unsupported JAX primitive: {jax_op_name}")
-
-# Usage:
-# jax_primitive = ... # Your JAX primitive
-# tflite_op = map_jax_to_tflite_op(jax_primitive)
-# print(f"JAX primitive {jax_primitive.name} maps to TFLite op {tflite_op.name}")
