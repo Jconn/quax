@@ -555,11 +555,7 @@ class GRUCell(nn.Module):
           dense_i(name='in')(inputs) + r * dense_h(name='hn', use_bias=True)(h), self.lhs_bits
         )
         #new_h = (1.0 - z) * n + z * h
-
-        new_h = (1.0 - z)
-        new_h = new_h * n
-        tmp = z * h
-        new_h = new_h + tmp
+        new_h = (1.0 - z) * n + z * h
 
         return new_h, new_h
 

@@ -85,7 +85,6 @@ class CNN(nn.Module):
         x = x - y
         x = quax.concatenate([x,y], axis=1)
         x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias)(x)
-        out_x = x 
         out_x,rec_x = GRUCell(lhs_bits=act_bits, rhs_bits=weight_bits)(recurrent,x)
         #x = out_x + rec_x
         x = Dequantize()(out_x)
@@ -455,6 +454,7 @@ def tflite_invoke(interpreter, float_input):
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
     input_index = input_details[1]['index']
+    recurrent_index = input_details[0]['index']
 
 
 
@@ -471,7 +471,7 @@ def tflite_invoke(interpreter, float_input):
     #interpreter.set_tensor(0,input_index)
 
     interpreter.set_tensor(input_index, quantized_input)
-
+    interpreter.set_tensor(recurrent_index, jnp.ones([1,10]))
     # Run inference
     interpreter.invoke()
     # Get the output
