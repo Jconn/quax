@@ -13,8 +13,8 @@
 # limitations under the License.
 """Mnist example."""
 import os
-os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
-os.environ['CUDA_VISIBLE_DEVICES'] = "-1" 
+#os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
+#os.environ['CUDA_VISIBLE_DEVICES'] = "-1" 
 import copy
 import functools
 import sys
@@ -41,12 +41,12 @@ from jax.experimental import jax2tf
 import tensorflow as tf
 
 from quax.jax2tflite import FBB
-from quax.quax import QDense, Quantize, QConv, enroll_model
+from quax.quax import QDense, Quantize, QConv, enroll_model, Dequantize, GRUCell
 from quax import quax
 
 class CNN(nn.Module):
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, recurrent):
         enroll_model(self)
         act_bits = 16 
         weight_bits = 8
@@ -61,9 +61,19 @@ class CNN(nn.Module):
         #    x = x.dequant()
 
         use_running_avg = False
+        #x = QConv(features=2, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+        #x = nn.Conv(features=32, kernel_size=(3,3), use_bias = True, padding='VALID')(x)
+        #x = nn.relu(x)
+        #x = x.reshape(x.shape[0], -1)
+        #x = nn.Dense(features=256, use_bias = bias)(x)
+        #x = nn.Dense(features=256, use_bias = bias)(x)
+        #x = nn.relu(x)
+        #x = nn.Dense(features=10, use_bias = bias)(x)
         x = Quantize(bits=act_bits)(x)
-        #x = QConv(features=32, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
-        x = QConv(features=16, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+        recurrent = Quantize(bits=act_bits)(recurrent)
+        x = QConv(features=32, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+
+        x = x[...,:8]
         x = x.reshape((x.shape[0], -1))
         #x = QDense(features=512,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
         x = x[:,100:]
@@ -72,9 +82,13 @@ class CNN(nn.Module):
         y = QDense(features=256,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
         x = x + y
         #x = x * y 
+        x = x - y
         x = quax.concatenate([x,y], axis=1)
         x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias)(x)
-        return x.x
+        out_x,rec_x = GRUCell(lhs_bits=act_bits, rhs_bits=weight_bits)(recurrent,x)
+        #x = out_x + rec_x
+        x = Dequantize()(out_x)
+        return x
 
 @functools.partial(jax.jit, static_argnums=(3,))
 def apply_model(model_params, images, labels, apply_fn):
@@ -83,17 +97,15 @@ def apply_model(model_params, images, labels, apply_fn):
   def loss_fn(model):
     logits, updated_var = apply_fn(
         model,
-        images,
+        images, jnp.ones([images.shape[0],10]),
         rngs={'params': jax.random.PRNGKey(0)},
         mutable=True,
     )
     one_hot = jax.nn.one_hot(labels, 10)
     loss = jnp.mean(optax.softmax_cross_entropy(logits=logits, labels=one_hot))
     return loss, (logits, updated_var)
-
   grad_fn = jax.value_and_grad(loss_fn, has_aux=True, allow_int=True)
   aux, grads = grad_fn(model_params)
-  #import pdb; pdb.set_trace()
   #grads['params']['Conv_0']['kernel']
   loss, (logits, updated_var) = aux
   accuracy = jnp.mean(jnp.argmax(logits, -1) == labels)
@@ -175,10 +187,14 @@ class TrainState(struct.PyTreeNode):
 def create_train_state(rng):
   """Creates initial `TrainState`."""
   cnn_train = CNN()
-  model = cnn_train.init({'params': rng}, jnp.ones([1, 28, 28, 1]))
+  model = cnn_train.init({'params': rng}, jnp.ones([1, 28, 28, 1]), jnp.ones([1,10]))
   learning_rate = 0.1
   momentum = 0.9
   tx = optax.sgd(learning_rate, momentum)
+
+  def mask_fn(tree):
+      return {k: (True if k == "params" else False) for k, v in tree.items()}
+  #tx = optax.masked(tx, mask_fn)
   cnn_eval = CNN()
   return TrainState(
       cnn_train=cnn_train,
@@ -208,12 +224,15 @@ def train_and_evaluate(
   batch_size = 128
   for epoch in range(1, num_epochs + 1):
     rng, input_rng = jax.random.split(rng)
+
     state, train_loss, train_accuracy = train_epoch(
         state, train_ds, batch_size, input_rng
     )
-    _, test_loss, test_accuracy, _ = apply_model(
-        state.model, test_ds['image'], test_ds['label'], state.cnn_eval.apply
-    )
+    #_, test_loss, test_accuracy, _ = apply_model(
+    #    state.model, test_ds['image'], test_ds['label'], state.cnn_eval.apply
+    #)
+    test_loss = 0.
+    test_accuracy = 0.
 
     print(
         'epoch:% 3d, train_loss: %.30f, train_accuracy: %.30f, test_loss:'
@@ -419,7 +438,7 @@ def test_translate(tflite_model, state, weight_only: bool = True):
 
 
   
-  mlogits, updated_var = state.cnn_train.apply(state.model,sample_image,rngs={'params': jax.random.PRNGKey(0)},mutable=True,)
+  mlogits, updated_var = state.cnn_train.apply(state.model,sample_image,jnp.ones([1,10]), rngs={'params': jax.random.PRNGKey(0)},mutable=True,)
   tfl_loss = jnp.mean(optax.softmax_cross_entropy(logits=out_logs, labels=one_hot))
   jax_loss = jnp.mean(optax.softmax_cross_entropy(logits=mlogits, labels=one_hot))
   if jnp.abs(jax_loss - tfl_loss) > .05:
@@ -428,18 +447,20 @@ def test_translate(tflite_model, state, weight_only: bool = True):
       print(f"tflite jax PASS - tfl; {tfl_loss}, jax - {jax_loss}")
 
 def tflite_invoke(interpreter, float_input):
-    interpreter.allocate_tensors()
 
     # Get input and output details
+
+    interpreter.allocate_tensors()
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
+    input_index = input_details[1]['index']
+    recurrent_index = input_details[0]['index']
 
-    # Assuming a single input tensor
-    input_index = input_details[0]['index']
-    input_shape = input_details[0]['shape']
+
+
 
     # Read quantization parameters
-    quantization_params = input_details[0]['quantization']  # (scale, zero_point)
+    quantization_params = input_details[1]['quantization']  # (scale, zero_point)
     scale, zero_point = quantization_params
 
     # Quantize the float input to int16
@@ -448,8 +469,9 @@ def tflite_invoke(interpreter, float_input):
 
     # Ensure the input tensor matches the expected type and shape
     #interpreter.set_tensor(0,input_index)
-    interpreter.set_tensor(input_index, quantized_input)
 
+    interpreter.set_tensor(input_index, quantized_input)
+    interpreter.set_tensor(recurrent_index, jnp.ones([1,10]))
     # Run inference
     interpreter.invoke()
     # Get the output
@@ -466,13 +488,14 @@ def main(argv):
   del argv
 
   # 1. TRAIN.
+
   state = train_and_evaluate(
-      num_epochs=3, workdir='/tmp/aqt_mnist_example')
+      num_epochs=1, workdir='/tmp/aqt_mnist_example')
 
   x = jnp.ones([1, 28, 28, 1])
   converter = FBB()
   with jax.disable_jit():
-      tflite = converter.convert(state.cnn_train, state.model, x)
+      tflite = converter.convert(state.cnn_train, state.model, x=x,recurrent = jnp.ones([1,10]))
   with open('mnist_quax.tflite', 'wb') as f:
       f.write(tflite)
 

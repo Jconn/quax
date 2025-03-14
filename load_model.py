@@ -2,7 +2,7 @@ import flatbuffers
 import numpy as np
 from tensorflow.lite.tools import flatbuffer_utils
 # Assuming the flatbuffer schema files have been generated and are available in your path
-from tflite_schema_py_generated import (Model, SubGraph, Tensor, OperatorCode,
+from quax.tflite import (Model, SubGraph, Tensor, OperatorCode,
                                         Buffer, Operator, BuiltinOperator, 
                                         BuiltinOptions, FullyConnectedOptions,
                                         ActivationFunctionType)

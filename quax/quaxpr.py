@@ -2,6 +2,7 @@ from jax import core
 from enum import Enum
 from jax.interpreters import ad
 import jax.numpy as jnp 
+import jax
 
 
 class Operation(Enum):
@@ -16,6 +17,15 @@ class Operation(Enum):
     MUL = 8
     CONCATENATE = 9
     SLICE = 10
+    DEQUANTIZE = 11
+    SUB = 12
+    TRANSPOSE = 13
+
+class ActivationType(Enum):
+    SIGMOID = 0
+    RELU = 1
+    TANH = 2
+    RELU6 = 3
 
 class AppendedActivation(Enum):
     RELU = 0
@@ -65,11 +75,13 @@ def quaxpr_multiarg(*args, op, mdl, **kwargs):
 
 
 def quaxpr_impl(*args, quax_pytree):
-    return args[0] 
+    return args[0]
+
 
 def quaxpr_abstract_eval(*avals, quax_pytree):
     xs = avals[0]
-    return core.ShapedArray(xs.shape, xs.dtype)
+    return core.ShapedArray(xs.shape, xs.dtype) 
+
 
 #def quaxpr_impl(x,y, quax_pytree):
 #    return x
@@ -81,11 +93,36 @@ def quaxpr_abstract_eval(*avals, quax_pytree):
 quaxpr_p.def_impl(quaxpr_impl)
 quaxpr_p.def_abstract_eval(quaxpr_abstract_eval)
 # Define the JVP rule for differentiation
+def _zero_from_primal(p,t):
+    assert type(p) is not ad.UndefinedPrimal
+    aval = jax.core.get_aval(p)
+    if hasattr(aval, "to_tangent_aval"):
+        # JAX >=0.4.34
+        aval = aval.to_tangent_aval()  # pyright: ignore
+    else:
+        # earlier JAX
+        aval = aval.at_least_vspace()
+    #import pdb; pdb.set_trace()
+    #import pdb; pdb.set_trace()
+    #return jax.core.ShapedArray(aval, jax.dtypes.float0)
+    #return aval
+    new_t = ad.Zero(aval)
+    return aval
+    return t 
+
 def quaxpr_jvp(primals, tangents, **params):
     #xp, yp = primals
+    tangents = tuple([_zero_from_primal(p,t) if type(t) is ad.Zero else t for p,t in zip(primals,tangents)])
     t_x= tangents
     y = quaxpr_p.bind(*primals, **params)
     return y, t_x
+
+
+def quaxpr_lowering(ctx, *args, quax_pytree):
+    return [args[0]]
+from jax.interpreters import mlir
+
+mlir.register_lowering(quaxpr_p, quaxpr_lowering, platform='gpu')
 
 #i guess need jvp rules for every value
 

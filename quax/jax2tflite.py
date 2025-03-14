@@ -1,22 +1,22 @@
 import jax
 import jax.numpy as jnp
 from jax.tree_util import tree_flatten
-from tflite_schema_py_generated import (Model, SubGraph, Tensor, OperatorCode,
+from quax.tflite import (Model, SubGraph, Tensor, OperatorCode,
                                         Buffer, Operator, BuiltinOperator, 
                                         BuiltinOptions, FullyConnectedOptions,
                                         ActivationFunctionType, ActivationFunctionType)
 
 from quax.tflite_utils import (get_empty_buffer, add_buffer, add_tensor, 
                             add_empty_tensor, add_tensor_with_buffer, add_fc_layer, add_conv_layer,
-                                add_add_layer,add_mul_layer, create_subgraph, create_model,create_signature_def,
+                                add_vec_layer,add_mul_layer, create_subgraph, create_model,create_signature_def,
                                export_tflite, create_runtime_metadata,create_conversion_metadata, add_reshape_layer, add_slice_layer, add_relu_layer,add_activation_layer,
-                               add_quantization_params, add_quant_layer)
+                               add_quantization_params, add_quant_layer, add_dequant_layer,add_transpose_layer)
 import quax.tflite_utils as tflite_utils
 import quax.tflite_utils as tflu 
 import flatbuffers
 from dataclasses import dataclass
 import logging
-from quax.quax import Operation, AppendedActivation 
+from quax.quax import Operation, AppendedActivation, ActivationType
 from quax.quax_utils import bits_to_type 
 import numpy as np
 from quax.quaxpr import QUAXPR_NAME
@@ -77,30 +77,26 @@ class FBB:
         self.weight_buffer_map = {}
         self.handlers[Operation.FC] = self.fc_handler
         self.handlers[Operation.QUANTIZE] = self.quant_handler
+        self.handlers[Operation.DEQUANTIZE] = self.dequant_handler
         self.handlers[Operation.CONV] = self.conv_handler
         self.handlers[Operation.ACTIVATION] = self.activation_handler
         self.handlers[Operation.RESHAPE] = self.reshape_handler
+        self.handlers[Operation.TRANSPOSE] = self.transpose_handler
         self.handlers[Operation.SLICE] = self.slice_handler
-        self.handlers[Operation.ADD] = self.add_handler
+        self.handlers[Operation.ADD] = self.vector_operator_handler
+        self.handlers[Operation.SUB] = self.vector_operator_handler
         self.handlers[Operation.MUL] = self.mul_handler
         self.handlers[Operation.CONCATENATE] = self.concat_handler
 
-
-
-
-
     def process_quax_op(self, op, quaxbegin, quaxend):
+        print(f"processing {op} - {quaxbegin.invars} - {quaxend.invars}")
         self.handlers[op](quaxbegin, quaxend)
 
-    def convert(self, model, params, inputs):
+    def convert(self, model, params, **inputs):
         #model_jaxpr = jax.make_jaxpr(model.apply)(params, inputs)
-        x = model.apply(params, inputs,rngs={'params': jax.random.key(0)}, mutable=False )
-        #mutable=False fails here, something about the transform doesn't like it
-        #mutable=True also fails, it doesn't like that "Invalid Filter" but why
-        model_jaxpr = jax.make_jaxpr(model.apply)(params, inputs,rngs={'params': jax.random.key(0)})
-        invars = model_jaxpr.jaxpr.invars
+        model_jaxpr = jax.make_jaxpr(model.apply)(params, **inputs,rngs={'params': jax.random.key(0)})
         flat_params, _ = tree_flatten(params)
-        param_map = {str(var): value for var, value in zip(invars[:len(flat_params)], flat_params)}
+        self.all_invars = model_jaxpr.jaxpr.invars
         self.model_params = params
         self.buffers.append(get_empty_buffer(self.builder))
         #for k,v in param_map.items():
@@ -109,7 +105,6 @@ class FBB:
         #for eqn in model_jaxpr.eqns:
         #    self.eqn_handler(eqn)
         quaxpr_eqns =  parse_quaxprs(model_jaxpr)
-
         for quaxbegin, quaxend in zip(quaxpr_eqns[::2], quaxpr_eqns[1::2]):
             op = quaxbegin.params['quax_pytree']['op']
             self.process_quax_op(op, quaxbegin, quaxend)
@@ -179,30 +174,64 @@ class FBB:
         dtype = bits_to_type(qxt.bits) 
         shape = out_var.aval.shape
         out_qparams = add_quantization_params(self.builder, None, None, scale, zero_point, quantized_dim = 0)
-        tensor = add_empty_tensor(self.builder, "activation", shape, self.buffers, quantization_params = out_qparams,dtype=dtype)
+        tensor = add_empty_tensor(self.builder, f"activation_{out_var}", shape, self.buffers, quantization_params = out_qparams,dtype=dtype)
 
         self.record_activation(out_var, tensor)
         self.record_quantization_details(out_var, (out_qparams, dtype) )
         return tensor
 
-    def add_handler(self, quaxbegin, quaxend):
+    def vector_operator_handler(self, quaxbegin, quaxend):
         #add has two input vars, one output var
-
+        op = quaxbegin.params['quax_pytree']['op']
         out_qxt = self.get_quaxtensor(quaxbegin, quaxbegin.params['quax_pytree']['op_name'])
         out_tensor = self.make_empty_tensor(out_qxt, quaxend.invars[0]) 
+
+        has_scalar =  quaxbegin.params['quax_pytree']['has_scalar']
+        if has_scalar:
+            #have to record scalar for this case
+            scalar_name = f"{quaxbegin.params['quax_pytree']['op_name']}-scalar"
+            scalar_qxt = self.get_quaxtensor(quaxbegin, scalar_name)
+
+            scalar_dtype = bits_to_type(scalar_qxt.bits) 
+            scalar = scalar_qxt.quantized_tensor() 
+            scalar = scalar.astype(scalar_dtype)
+            #TODO - why are we indexing into weight scale
+
+            #TODO - aqt has no zero point quant support
+            scalar_qparams = make_quant_params(self.builder, scalar_qxt)
+            scalar_tensor = add_tensor(self.builder, "scalar", jnp.transpose(scalar), self.buffers, quantization_params = scalar_qparams, dtype = scalar_dtype)
+            #TODO - fix the scalar recording here
+            self.record_activation(quaxbegin.invars[1], scalar_tensor)
+            
         in_tensors = [self.tensor_act_map[str(x)] for x in quaxbegin.invars]
         out_var = quaxend.invars[0]
-
         self.record_activation(out_var, out_tensor)
+        vec_op_map = {}
+        vec_op_map[Operation.ADD] = BuiltinOperator.BuiltinOperator().ADD
+        vec_op_map[Operation.SUB] = BuiltinOperator.BuiltinOperator().SUB
+        vec_op_map[Operation.MUL] = BuiltinOperator.BuiltinOperator().MUL
+        vec_op = vec_op_map[op]
 
-        op = add_add_layer(self.builder,in_tensors[0], in_tensors[1],out_tensor, all_tensors=self.tensors, all_opcodes=self.opcodes) 
+        op = add_vec_layer(self.builder,in_tensors[0], in_tensors[1],out_tensor, vec_op , all_tensors=self.tensors, all_opcodes=self.opcodes) 
         self.record_op(op)
 
     def concat_handler(self, quaxbegin, quaxend):
         out_var = quaxend.invars[0]
-        out_qxt = self.get_quaxtensor(quaxbegin, quaxbegin.params['quax_pytree']['op_name'])
+        out_qxt = self.get_quaxtensor(quaxbegin, quaxend.params['quax_pytree']['op_name'])
         out_tensor = self.make_empty_tensor(out_qxt,  out_var) 
-        in_tensors = [self.tensor_act_map[str(x)] for x in quaxbegin.invars]
+        in_tensors = []
+        for idx, invar in enumerate(quaxbegin.invars):
+            act_key =  str(invar)
+            if not self.is_recorded_activation(act_key):
+                if invar not in self.all_invars:
+                    raise Exception("could not find invar")
+                else:
+                    var_name = f"{quaxbegin.params['quax_pytree']['op_name']}-{idx}"
+                    var_qxt = self.get_quaxtensor(quaxbegin, var_name)
+                    self.make_empty_tensor(var_qxt, invar) 
+            in_tensors.append(self.get_activation_tensor(act_key))
+
+        #in_tensors = [self.tensor_act_map[str(x)] for x in quaxbegin.invars]
         axis = quaxbegin.params['quax_pytree']['axis']
 
         self.record_activation(out_var, out_tensor)
@@ -229,8 +258,23 @@ class FBB:
         input_qparams, input_dtype = self.quant_map[str(invar)]
         out_tensor = add_empty_tensor(self.builder, "activation", outvar.aval.shape, self.buffers, quantization_params = input_qparams, dtype = input_dtype)
         self.record_activation(outvar, out_tensor)
+        self.record_quantization_details(outvar, (input_qparams, input_dtype) )
         #let this decide if we are slicing or strided slicing
         op = add_slice_layer(self.builder, in_tensor, out_tensor, slice_key, self.tensors, self.opcodes, self.buffers) 
+        self.record_op(op)
+
+    def transpose_handler(self, quaxbegin, quaxend):
+        #TODO - need to grab the quantization details from the input tensor
+        invar = quaxbegin.invars[0]
+        outvar = quaxend.invars[0]
+        in_tensor = self.get_activation_tensor(invar)
+
+        input_qparams, input_dtype = self.quant_map[str(invar)]
+        out_tensor = add_empty_tensor(self.builder, "activation", outvar.aval.shape, self.buffers, quantization_params = input_qparams, dtype = input_dtype)
+        self.record_activation(outvar, out_tensor)
+        self.record_quantization_details(outvar, (input_qparams, input_dtype) )
+
+        op = add_transpose_layer(self.builder, in_tensor, out_tensor, outvar.aval.shape, self.tensors, all_opcodes = self.opcodes) 
         self.record_op(op)
 
     def reshape_handler(self, quaxbegin, quaxend):
@@ -353,10 +397,13 @@ class FBB:
 
         act_var = in_var 
         act_key =  str(act_var)
-        if act_key in self.tensor_act_map.keys():
-            activation_tensor = self.tensor_act_map[act_key]
-        else:
-            raise Exception(f"couldn't find activation tensor with key {act_key}")
+        if not self.is_recorded_activation(act_key):
+            if in_var not in self.all_invars:
+                raise Exception("could not find invar")
+            else:
+                self.make_empty_tensor(in_qxt, in_var) 
+            
+        activation_tensor = self.get_activation_tensor(act_key)
             
         #TODO why does weight have to be transposed
         weight_tensor = add_tensor(self.builder, "weight", jnp.transpose(weight), self.buffers, quantization_params = weight_qparams, dtype = weight_dtype)
@@ -412,6 +459,32 @@ class FBB:
         out_zp = jnp.zeros(out_scale.shape, dtype=np.int32)
         return out_zp
 
+    def dequant_handler(self, quaxbegin, quaxend):
+        if 'op_name' in quaxend.params['quax_pytree'].keys():
+            op_name = quaxend.params['quax_pytree']['op_name']
+        else:
+            op_name = 'input'
+
+        in_qxt = self.get_quaxtensor(quaxbegin, op_name)
+        
+        quant_var = quaxbegin.invars[0]
+        dequant_var = quaxend.invars[0]
+
+        if str(quant_var) in self.tensor_act_map.keys():
+            in_tensor = self.tensor_act_map[str(quant_var)]
+        else:
+            in_tensor = self.make_empty_tensor(in_qxt, quaxbegin.invars[0]) 
+
+
+        out_tensor = add_empty_tensor(self.builder, "activation", dequant_var.aval.shape, self.buffers, quantization_params = None, dtype = np.float32)
+        self.record_activation(dequant_var, out_tensor)
+
+
+        #also map the invar to this tensor, because quant is special
+        #TODO - add quant op
+        op = add_dequant_layer(self.builder,input_tensor=in_tensor,output_tensor=out_tensor, all_tensors=self.tensors, all_opcodes=self.opcodes) 
+        self.record_op(op)
+
     def quant_handler(self, quaxbegin, quaxend):
         if 'op_name' in quaxend.params['quax_pytree'].keys():
             op_name = quaxend.params['quax_pytree']['op_name']
@@ -426,7 +499,7 @@ class FBB:
         if str(in_var) in self.tensor_act_map.keys():
             in_tensor = self.tensor_act_map[str(in_var)]
         else:
-            in_tensor = add_empty_tensor(self.builder, "activation", quant_var.aval.shape, self.buffers, quantization_params = None, dtype = np.float32)
+            in_tensor = add_empty_tensor(self.builder, f"activation_{in_var}", quant_var.aval.shape, self.buffers, quantization_params = None, dtype = np.float32)
         self.record_activation(in_var, in_tensor)
 
         out_tensor = self.make_empty_tensor(out_qxt, quaxend.invars[0]) 
@@ -465,7 +538,6 @@ class FBB:
         self.tensors.append(tensor)
 
     def eqn_handler(self, eqn):
-        print(f"eqn {eqn}")
         self.handlers[str(eqn.primitive.name)](eqn)
 
     def record_op(self, op):
@@ -510,53 +582,25 @@ class FBB:
         #activation_handler['relu'] = self.relu_handler
         self.activation_handler(eqn, activation_name=eqn.params['call_jaxpr'].jaxpr.eqns[0].params['name'])
 
-    def tanh_handler(self, eqn):
-        self.activation_handler(eqn, str(eqn.primitive))
 
-    def activation_handler(self, eqns):
-        weight_path, quax_path = self.parse_details(eqns)
-        act_eqn = eqns[1]
-        in_tensors = self.process_invars(act_eqn)
-
-        activation_dtype, weight_dtype, out_dtype, bias_dtype = self.construct_mathy_dtypes(quax_path)
-
-
-        out_quantize = weight_path['output']
-
-        out_bits = quax_path['bits'][0]['out']
-        out_dtype = bits_to_type(out_bits)
-
-        out_scale = out_quantize.scale[0]
-        out_var = act_eqn.outvars[0]
-        zero_point = jnp.zeros(out_scale.shape, dtype=np.int32)
-        out_qparams = add_quantization_params(self.builder, None, None, out_scale, zero_point, quantized_dim = 0)
-        out_tensor = add_empty_tensor(self.builder, "activation", out_var.aval.shape, self.buffers, quantization_params = out_qparams,dtype=out_dtype)
-
-        self.record_activation(act_eqn.outvars[0], out_tensor)
-        self.record_quantization_details(act_eqn.outvars[0], (out_qparams, out_dtype))
-
-        out_tensor = self.make_empty_tensor(out_qxt, shape = quaxend.invars[0].aval.shape) 
-
-        def eqn_to_tflite_op(eqn):
-            key = eqn.primitive.name
-            eqn_map = {}
-            eqn_map['tanh'] = BuiltinOperator.BuiltinOperator().TANH
-            eqn_map['logistic'] = BuiltinOperator.BuiltinOperator().LOGISTIC
-            return eqn_map[key]
-        activation_operator = eqn_to_tflite_op(act_eqn)
+    def activation_handler(self, quaxbegin, quaxend):
+        out_qxt = self.get_quaxtensor(quaxend, 'output')
+        out_tensor = self.make_empty_tensor(out_qxt, quaxend.invars[0]) 
+        invar = quaxbegin.invars[0]
+        in_tensor = self.get_activation_tensor(invar)
+        out_var = quaxend.invars[0]
+        self.record_activation(out_var, out_tensor)
 
 
-        op = tflite_utils.add_activation_layer(self.builder, in_tensors[0], out_tensor, activation_operator, self.tensors, self.opcodes)
+        act_map = {}
+        act_map[ActivationType.TANH] = BuiltinOperator.BuiltinOperator().TANH
+        act_map[ActivationType.SIGMOID] = BuiltinOperator.BuiltinOperator().LOGISTIC
+
+        activation_operator = act_map[quaxend.params['quax_pytree']['act_type']]
+
+
+        op = tflite_utils.add_activation_layer(self.builder, in_tensor, out_tensor, activation_operator, self.tensors, self.opcodes)
         self.record_op(op)
-
-
-    def relu_handler(self, eqn):
-        in_tensors = self.process_invars(eqn)
-        out_tensors = self.process_outvars(eqn)
-        op = add_relu_layer(self.builder, in_tensors[0], out_tensors[0], self.tensors, self.opcodes)
-        self.record_op(op)
-
-    
 
 
 

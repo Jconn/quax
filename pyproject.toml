@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quax"
+version = "0.1.0"
+description = "quantized training and tflite export with jax"
+authors = [
+    {name = "John Connolly", email = "john.will.connolly@gmail.com"}
+]
+license = {text = "MIT License"}
+readme = "README.md"
+requires-python = ">=3.8"
+
+
+dependencies = [
+    "absl-py",
+    "jax",
+    "flax",
+    "tensorflow",
+    "tensorflow-datasets",
+    "optax",
+    "numpy",
+    "quax",
+    "dataclasses"
+]
+[tool.setuptools]
+packages = ["quax"]
+include-package-data = true
+
+
+[tool.setuptools.package-data]
+quax = ["*"]
+
+[tool.setuptools.exclude-package-data]
+"*" = [ "test*.py", "*.tflite", "TODO", "README.md"]

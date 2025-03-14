@@ -33,7 +33,7 @@ class InheritedCalbration(Calibration):
   scale: jnp.ndarray | float
   bias: None | jnp.ndarray | float = None
 
-  def get_scale_and_bias(
+  def get_scale_and_bias_and_sparsity(
       self,
       x: jnp.ndarray,
       shared_axes,
@@ -48,7 +48,8 @@ class InheritedCalbration(Calibration):
       bias = [jnp.full(x.shape, self.bias, x.dtype)]
     else:
       bias = [self.bias.astype(dtype)]
-    return [self.scale.astype(dtype)], bias
+    #sparsity now i guess..
+    return [self.scale.astype(dtype)], bias, None
 
 
 
@@ -81,13 +82,24 @@ def requantizer(bits, scale, po2_scaling = False):
     quant.init_calibration()
     return quant
 
-def quantizer(bits, po2_scaling = False):
+def quantizer(bits, po2_scaling = False, scale=None):
     #TODO - how to deal with context
     dtype = bits_to_type(bits)
-    quant_calib = functools.partial(
-        calibration.AbsMaxCalibration,
-        po2_scale=po2_scaling,
-    )
+    if scale:
+        if not isinstance(scale, jnp.ndarray):
+            scale = jnp.array(scale)
+
+        quant_calib = functools.partial(
+            InheritedCalbration,
+            po2_scale=po2_scaling,
+            scale =scale 
+        )
+
+    else:
+        quant_calib = functools.partial(
+            calibration.AbsMaxCalibration,
+            po2_scale=po2_scaling,
+        )
     quant = Quantizer(
         numerics=int_numerics.IntSymmetric(
             bits=bits,

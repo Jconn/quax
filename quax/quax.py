@@ -14,7 +14,7 @@ from aqt.jax.v2 import config as aqt_config
 from jax import eval_shape, lax
 from enum import Enum
 from quax.quax_config import OpConfig, quantizer, requantizer
-from quax.quaxpr import quaxpr_prim, Operation, pytree_fc, quaxpr_default, quaxpr_multiarg, quaxpr_functional, quaxpr_unquant_prim, AppendedActivation
+from quax.quaxpr import quaxpr_prim, Operation,ActivationType, pytree_fc, quaxpr_default, quaxpr_multiarg, quaxpr_functional, quaxpr_unquant_prim, AppendedActivation
 import numpy as np
 from jax.core import ShapedArray
 from flax.linen.dtypes import promote_dtype
@@ -22,7 +22,7 @@ from quax.quax_utils import bits_to_type
 from aqt.jax.v2.aqt_tensor import QTensor
 from jax.interpreters import ad
 from aqt.jax.v2 import aqt_tensor
-
+from functools import partial
 from flax.typing import (
   Any,
   Array,
@@ -38,7 +38,25 @@ from flax.typing import (
   Sequence
 )
 
+import copy
 model_enroll = None
+
+def quaxtensor_from_scalar(scalar , qx):
+    array = jnp.array(scalar)
+    out_quantizer = requantizer(qx.bits,qx.qx.scale, po2_scaling = False)
+    new_qx = quantize(array, calibration_axes=[x for x in range(0, array.ndim)], q = out_quantizer, scope = None)
+    return new_qx
+
+
+def zeros(shape, bits):
+    x = jnp.zeros(shape)
+    qx = aqt_tensor.zeros(shape, container_dtype = jnp.float32)
+    scale = jnp.array([1./(2**bits-1)])
+    scale = scale.reshape((1,) + (1,) * (len(shape)-1)) 
+    qx.scale.append(scale)
+    quaxt = QuaxTensor(x = x, qx = qx, bits = bits)
+    return quaxt
+
 def enroll_model(mdl):
     global model_enroll
     model_enroll = mdl
@@ -46,12 +64,16 @@ def enroll_model(mdl):
 def enrolled_model():
     return model_enroll
 
-def store_quantized(mdl, name, qxtensor):
+def store_quantized(mdl, name, qxtensor,scale_only=False):
     init_fn = lambda: 0
     reduce_fn = lambda a, b:  b
     #will return true if the store succeeds
     #will fail by default when no longer mutable
-    return mdl.sow('quax', name, qxtensor,
+    qxcopy = qxtensor
+    if scale_only:
+        qxcopy = copy.deepcopy(qxcopy)
+        qxcopy.qx = qxcopy.qx.without_qvalue()
+    return mdl.sow('quax', name, qxcopy,
                   init_fn=init_fn, reduce_fn=reduce_fn)
 
 
@@ -78,6 +100,23 @@ def marker_jvp(primals, tangents, **params):
 
 ad.defjvp(marker_p, marker_jvp)
 
+class Dequantize(nn.Module):
+    '''
+    this takes as input a quaxtensor
+    returns a numpy tensor
+    '''
+    op_type: Operation = Operation.DEQUANTIZE
+
+    @nn.compact
+    def __call__(self, qx):
+        quax_pytree = {}
+        quax_pytree['op'] = self.op_type
+        #this is unquantized, so we can't use the default quaxpr gen here
+        store_quantized(self, 'input', qx)
+        quaxpr_default(qx, self.op_type,self )
+        x = qx.x
+        quaxpr_unquant_prim(x, quax_pytree)
+        return x 
 
 class Quantize(nn.Module):
     bits: int
@@ -182,10 +221,24 @@ class QuaxTensor:
         quaxtensor_reshape(shape, self)
         return self
 
+    #TODO - these aren't supposedto mutate object
+    def squeeze(self, axis=None):
+        quaxtensor_squeeze(self,axis)
+        return self
+
+    def transpose(self, axes=None):
+        return quaxtensor_transpose(self, axes)
+
     def unquantized_tensor(self):
         return self.x
     def quantized_tensor(self):
         return self.qx.qvalue
+
+    def __sub__(self, other):
+        return self._apply_op(other, jnp.subtract, Operation.SUB)
+
+    def __rsub__(self, other):
+        return self.__sub__(other)
 
     def __add__(self, other):
         return self._apply_op(other, jnp.add, Operation.ADD)
@@ -213,14 +266,37 @@ class QuaxTensor:
         op_name = f"element-{op_name}"
         quaxpr_default(self, op_type, mdl, op_name = op_name)
         orig_shape = self.x.shape
-        self.x = self.x[key]
-        #we can retain the scale i think, since quantization happens on a per activation level
-        self.qx.qvalue = self.qx.qvalue[key]
-        #fix key at this stage
+
+        # Create new sliced arrays instead of modifying in place
+        new_x = self.x[key]
+        new_qvalue = self.qx.qvalue[key]
+
 
         if isinstance(key, slice):
             key = (key)
+
+        #great can only have one ellipsis
         new_key = []
+        for idx, kval in enumerate(key):
+            if isinstance(kval, type(Ellipsis)):
+                num_dims = len(orig_shape)
+                ellipse_fill = num_dims - (len(key) - 1) #do not count ellipse in the key size
+                for i in range(ellipse_fill):
+                    new_key.append(slice(None,None,None))
+            elif isinstance(kval, int): 
+                #this corrects for any ellipse
+                corrected_idx = len(new_key)
+
+                if kval <0:
+                    #if -1, it is the last dimension
+                    last_idx = orig_shape[corrected_idx] 
+                    kval = last_idx - kval
+                new_key.append(slice(kval,kval+1,1))
+            else:
+                new_key.append(kval)
+        key = new_key
+        new_key = []
+
         for dim_idx,sl in enumerate(key):
             begin, end, idx = sl.start, sl.stop, sl.step
             if begin is None:
@@ -231,8 +307,14 @@ class QuaxTensor:
                 idx = 1
             new_key.append(slice(begin, end, idx))
 
-        quaxpr_default(self, op_type, mdl, op_name = op_name, slice_key = new_key)
-        return self
+        
+        # Create and return new QuaxTensor with sliced data
+        new_qx_tensor = copy.deepcopy(self)
+        new_qx_tensor.x = new_x
+        new_qx_tensor.qx.qvalue = new_qvalue
+        quaxpr_default(new_qx_tensor, op_type, mdl, op_name = op_name, slice_key = new_key)
+
+        return new_qx_tensor
 
     def _apply_op(self, other, op, op_type):
         op_name = enrolled_model().scope.default_name("op") 
@@ -240,16 +322,23 @@ class QuaxTensor:
         op_name = f"element-{op_name}"
         out_quantizer = quantizer(self.bits, po2_scaling = False)
         #quaxpr_multiarg(self, other, op_type, enrolled_model(), op_name = op_name)
-        #quaxpr_default(self, op_type, enrolled_model(), t2=other, op_name = op_name)
-        quaxpr_multiarg(self, other, op=op_type, mdl=enrolled_model(), op_name = op_name)
-
+        has_scalar = False 
         if isinstance(other, QuaxTensor):
             new_x = op(self.x, other.x)
-            assert self.bits == other.bits 
+            quaxpr_multiarg(self, other, op=op_type, mdl=enrolled_model(), op_name = op_name, has_scalar = has_scalar)
         elif jnp.isscalar(other):
+            has_scalar = True
             new_x = op(self.x, other)
+            other = quaxtensor_from_scalar(other, self)
+            scalar_name = f"{op_name}-scalar"
+            #need to store the scalar for later still
+            store_quantized(enrolled_model(), scalar_name, other)
+            #TODO -need to store a quax quantized
+            #import pdb; pdb.set_trace()
+            quaxpr_multiarg(self, other, op=op_type, mdl=enrolled_model(), op_name = op_name, has_scalar = has_scalar)
         else:
             raise TypeError(f"Unsupported type for operation: {type(other)}")
+
         #unquantized output
         qx = quantize(new_x, calibration_axes=[y for y in range(0, new_x.ndim)], q = out_quantizer, scope = None)
         #this is the hard part for me
@@ -258,7 +347,22 @@ class QuaxTensor:
         quaxpr_default(qx, op_type, enrolled_model(), op_name = op_name)
         return qx
 
+def stack(arrays, axis, requant=True):
+    arrays = [expand_dims(x, axis) for x in arrays]
+    arrays= concatenate(arrays, axis, requant = requant)
+    return arrays
+
+def expand_dims(x, axis):
+    cur_shape = x.shape
+    new_shape = list(cur_shape)
+    if axis < 0:
+        axis = len(new_shape) - axis + 1
+    new_shape.insert(axis,1)
+    new_shape = tuple(new_shape)
+    return reshape(new_shape, x)
+
 def concatenate(arrays, axis=0, requant=True):
+    assert all(isinstance(x,QuaxTensor) for x in arrays), "need to use quax arrays"
     op = Operation.CONCATENATE
     mdl = enrolled_model()
     op_name = mdl.scope.default_name("op") 
@@ -279,6 +383,9 @@ def concatenate(arrays, axis=0, requant=True):
     if requant:
         arrays = [arrays[0]] + [requantize(x, scales[0]) for x in arrays[1:]]
 
+    for idx in range(len(arrays)):
+        var_name = op_name + f"-{idx}"
+        store_quantized(mdl, var_name, arrays[0], scale_only=True)
     quaxpr_multiarg(*arrays, op=op, mdl=mdl, axis = axis, op_name=op_name)
     base_arrs = [x.x for x in arrays]
     qval_arrs = [x.qx.qvalue for x in arrays]
@@ -313,15 +420,51 @@ def requantize(qx, scale):
     quaxpr_default(qx, op_type, mdl, op_name = op_name)
     return qx
 
+def quaxtensor_transpose(x, axes=None):
+    op_type = Operation.TRANSPOSE
 
+    quaxpr_functional(x, op_type)
+
+    # Create deep copy of original object
+    new_quaxt = copy.deepcopy(x)
+    
+    # Modify the copy's values
+    new_quaxt.x = jnp.transpose(x.x, axes)
+    new_quaxt.qx.qvalue = x.qx.qvalue.transpose(axes)  # Assuming QTensor supports transpose
+    #TODO - transpose scale correctly
+    
+    quaxpr_functional(new_quaxt, op_type)
+
+    return new_quaxt
+
+
+def quaxtensor_squeeze(x,axis=None):
+    assert isinstance(x, QuaxTensor), "use quaxtensor"
+
+    shape = list(x.shape)
+    
+    if axis is None:
+        # Remove all singleton dimensions
+        shape = [dim for dim in shape if dim != 1]
+    else:
+        # Ensure axis is a tuple
+        if isinstance(axis, int):
+            axis = (axis,)
+        
+        # Validate axes
+        for ax in axis:
+            if shape[ax] != 1:
+                raise ValueError(f"Cannot squeeze dimension {ax}, size is {shape[ax]}, not 1.")
+        
+        # Remove specified singleton dimensions
+        shape = [dim for i, dim in enumerate(shape) if i not in axis or dim != 1]
+    return quaxtensor_reshape(shape, x)
 
 def quaxtensor_reshape(shape, quaxt):
     quaxpr_functional(quaxt, Operation.RESHAPE )
     quaxt.x = quaxt.x.reshape(shape)
 
     qval = quaxt.qx.qvalue.reshape(shape)
-    batch_size = shape[0]
-    assert np.prod(quaxt.qx.scale[0].shape) == 1, "need single scale for reshape"
     new_scales = [ scale.reshape((1,) + (1,) * (qval.ndim-1)) for scale in quaxt.qx.scale]
     assert quaxt.qx.scale_t is None, "don't know how to handle this"
     #TODO - scale_t reshape
@@ -334,28 +477,29 @@ def reshape(shape, x):
     return x.reshape(shape)
 
 def sigmoid(x, out_bits):
-    x = Activation(out_bits, nn.sigmoid)(x) 
+    x = Activation(out_bits, nn.sigmoid, ActivationType.SIGMOID, scale = 1/32768.)(x) 
     return x 
 
 def tanh(x, out_bits):
-    x = Activation(out_bits, nn.tanh)(x) 
+    x = Activation(out_bits, nn.tanh, ActivationType.TANH, scale=1/32768.)(x) 
     return x 
 
 class Activation(nn.Module):
     lhs_bits: int
     act_fn: nn.activation
+    act_type: ActivationType
     op_type: Operation = Operation.ACTIVATION
+    scale: float = None
 
     @nn.compact
     def __call__(self, x):
         #x = x.dequant()
-        out_quantizer = quantizer(self.lhs_bits, po2_scaling = False)
-        quaxpr_default(x, self.op_type,self )
-        x = x.dequant()
-        x = self.act_fn(x)
-        qx = quantize(x, calibration_axes=[x for x in range(1, x.ndim)], q = out_quantizer, scope = self)
-        store_quantized(self, 'output', qx)
-        quaxpr_default(x, self.op_type,self )
+        out_quantizer = quantizer(self.lhs_bits, po2_scaling = False, scale = self.scale)
+        quaxpr_default(x, self.op_type,self, act_type = self.act_type )
+        x = self.act_fn(x.x)
+        x = quantize(x, calibration_axes=[x for x in range(0, x.ndim)], q = out_quantizer, scope = self)
+        store_quantized(self, 'output', x)
+        quaxpr_default(x, self.op_type,self, act_type = self.act_type)
         return x
 
 def map_appended_activation(act_fn):
@@ -364,6 +508,56 @@ def map_appended_activation(act_fn):
     act_map[nn.relu6] = AppendedActivation.RELU6
     act_map[None] = None
     return act_map[act_fn]
+
+class GRUCell(nn.Module):
+    lhs_bits: int
+    rhs_bits: int
+    gate_fn = sigmoid
+    activation_fn = tanh
+    kernel_init: Initializer = default_kernel_init
+    recurrent_kernel_init: Initializer = initializers.orthogonal()
+    bias_init: Initializer = initializers.zeros_init()
+    dtype: Dtype | None = None
+    param_dtype: Dtype = jnp.float32
+    carry_init: Initializer = initializers.zeros_init()
+
+
+    @nn.compact
+    def __call__(self, carry, inputs):
+        #need to wrap operation in the quaxpr
+        h = carry
+        hidden_features = h.shape[-1]
+        # input and recurrent layers are summed so only one needs a bias.
+        dense_h = partial(
+          QDense,
+          features=hidden_features,
+          lhs_bits = self.lhs_bits,
+          rhs_bits = self.rhs_bits,
+          use_bias=False,
+          param_dtype=self.param_dtype,
+          kernel_init=self.recurrent_kernel_init,
+          bias_init=self.bias_init,
+        )
+        dense_i = partial(
+          QDense,
+          features=hidden_features,
+          lhs_bits = self.lhs_bits,
+          rhs_bits = self.rhs_bits,
+          use_bias=True,
+          param_dtype=self.param_dtype,
+          kernel_init=self.kernel_init,
+          bias_init=self.bias_init,
+        )
+        r = sigmoid(dense_i(name='ir')(inputs) + dense_h(name='hr')(h), self.lhs_bits)
+        z = sigmoid(dense_i(name='iz')(inputs) + dense_h(name='hz')(h), self.lhs_bits)
+        # add bias because the linear transformations aren't directly summed.
+        n = tanh(
+          dense_i(name='in')(inputs) + r * dense_h(name='hn', use_bias=True)(h), self.lhs_bits
+        )
+        #new_h = (1.0 - z) * n + z * h
+        new_h = (1.0 - z) * n + z * h
+
+        return new_h, new_h
 
 class QDense(nn.Module):
     features: int
