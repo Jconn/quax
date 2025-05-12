@@ -9,7 +9,7 @@ from quax.tflite import (Model, SubGraph, Tensor, OperatorCode,
 from quax.tflite_utils import (get_empty_buffer, add_buffer, add_tensor, 
                             add_empty_tensor, add_tensor_with_buffer, add_fc_layer, add_conv_layer,
                                 add_vec_layer,add_mul_layer, create_subgraph, create_model,create_signature_def,
-                               export_tflite, create_runtime_metadata,create_conversion_metadata, add_reshape_layer, add_slice_layer, add_relu_layer,add_activation_layer,
+                               export_tflite, create_runtime_metadata,create_conversion_metadata, add_reshape_layer, add_slice_layer, add_strided_slice_layer, add_relu_layer,add_activation_layer,
                                add_quantization_params, add_quant_layer, add_dequant_layer,add_transpose_layer)
 import quax.tflite_utils as tflite_utils
 import quax.tflite_utils as tflu 
@@ -260,7 +260,12 @@ class FBB:
         self.record_activation(outvar, out_tensor)
         self.record_quantization_details(outvar, (input_qparams, input_dtype) )
         #let this decide if we are slicing or strided slicing
-        op = add_slice_layer(self.builder, in_tensor, out_tensor, slice_key, self.tensors, self.opcodes, self.buffers) 
+        if len(invar.aval.shape) > len(outvar.aval.shape):
+            op = add_slice_layer(self.builder, in_tensor, out_tensor, slice_key, self.tensors, self.opcodes, self.buffers) 
+        else:
+            op = add_strided_slice_layer(self.builder, in_tensor, out_tensor, slice_key, self.tensors, self.opcodes, self.buffers) 
+
+
         self.record_op(op)
 
     def transpose_handler(self, quaxbegin, quaxend):
@@ -274,7 +279,7 @@ class FBB:
         self.record_activation(outvar, out_tensor)
         self.record_quantization_details(outvar, (input_qparams, input_dtype) )
 
-        op = add_transpose_layer(self.builder, in_tensor, out_tensor, outvar.aval.shape, self.tensors, all_opcodes = self.opcodes) 
+        op = add_transpose_layer(self.builder, in_tensor, out_tensor, quaxend.params['quax_pytree']['axes'], self.buffers, self.tensors, all_opcodes = self.opcodes) 
         self.record_op(op)
 
     def reshape_handler(self, quaxbegin, quaxend):
@@ -288,7 +293,7 @@ class FBB:
         self.record_activation(outvar, out_tensor)
         self.record_quantization_details(outvar, (input_qparams, input_dtype) )
 
-        op = add_reshape_layer(self.builder, in_tensor, out_tensor, outvar.aval.shape, self.tensors, all_opcodes = self.opcodes) 
+        op = add_reshape_layer(self.builder, in_tensor, out_tensor, outvar.aval.shape, self.tensors, all_opcodes = self.opcodes,all_buffers=self.buffers) 
         self.record_op(op)
 
     def conv_handler(self, quaxbegin, quaxend):

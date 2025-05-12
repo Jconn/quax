@@ -71,9 +71,14 @@ class CNN(nn.Module):
         #x = nn.Dense(features=10, use_bias = bias)(x)
         x = Quantize(bits=act_bits)(x)
         recurrent = Quantize(bits=act_bits)(recurrent)
+
+        x = quax.concatenate([x,x,x], axis=-1)
+        #x = x.transpose((0,2,1,3))
+        x = QConv(features=8, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+        x = QConv(features=16, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
         x = QConv(features=32, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
 
-        x = x[...,:8]
+        #x = x[...,:8]
         x = x.reshape((x.shape[0], -1))
         #x = QDense(features=512,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
         x = x[:,100:]
@@ -490,7 +495,7 @@ def main(argv):
   # 1. TRAIN.
 
   state = train_and_evaluate(
-      num_epochs=1, workdir='/tmp/aqt_mnist_example')
+      num_epochs=3, workdir='/tmp/aqt_mnist_example')
 
   x = jnp.ones([1, 28, 28, 1])
   converter = FBB()

@@ -433,8 +433,9 @@ def quaxtensor_transpose(x, axes=None):
     new_quaxt.qx.qvalue = x.qx.qvalue.transpose(axes)  # Assuming QTensor supports transpose
     #TODO - transpose scale correctly
     
-    quaxpr_functional(new_quaxt, op_type)
 
+    mdl = enrolled_model()
+    quaxpr_default(new_quaxt, op_type, mdl, axes=axes)
     return new_quaxt
 
 

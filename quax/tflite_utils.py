@@ -50,6 +50,7 @@ def add_empty_tensor(builder, tensor_name, tensor_dims, buffers, quantization_pa
     #the 0 buffer is standard notation for empty buffer (e.g. activations)
     Tensor.AddBuffer(builder, 0) 
     Tensor.AddName(builder, tensor_name)
+    Tensor.AddHasRank(builder, True)
     Tensor.AddQuantization(builder,quantization_params)
     tensor = Tensor.End(builder)
     return tensor
@@ -103,6 +104,7 @@ def add_tensor_with_buffer(builder, tensor_name, np_shape, buffer, buffers, dtyp
     Tensor.Start(builder)
     Tensor.AddShape(builder, tensor_shape)
     Tensor.AddType(builder, map_tensor_type(dtype) ) 
+    Tensor.AddHasRank(builder, True)
     Tensor.AddBuffer(builder, buffer_idx) 
     Tensor.AddName(builder, tensor_name)
     Tensor.AddQuantization(builder,quant)
@@ -117,6 +119,7 @@ def add_empty_quant(builder):
 #tensor add should have a numpy and string as input
 def add_tensor(builder, tensor_name, np_data, buffers, quantization_params = None, dtype = np.float32):
     #TODO - datatype resolution
+    #TODO - type checking on input buffer and requested type
     np_shape = np_data.shape
     tensor_name = builder.CreateString(tensor_name)
 
@@ -143,6 +146,8 @@ def add_tensor(builder, tensor_name, np_data, buffers, quantization_params = Non
     Tensor.AddType(builder, map_tensor_type(dtype) ) 
     Tensor.AddBuffer(builder, buffer_idx) 
     Tensor.AddName(builder, tensor_name)
+    #TODO - tensor rank
+    Tensor.AddHasRank(builder, True)
     Tensor.AddQuantization(builder,quantization_params)
     tensor = Tensor.End(builder)
     return tensor
@@ -191,6 +196,7 @@ def add_vec_layer(builder, input_tensor1, input_tensor2, output_tensor,vec_op, a
     vec_options = None
     OperatorCode.Start(builder)
     OperatorCode.AddBuiltinCode(builder, vec_op)
+    OperatorCode.AddDeprecatedBuiltinCode(builder, vec_op)
     add_opcode = OperatorCode.End(builder)
     # Create inputs and outputs
     inputs = create_operator_inputs(builder, [input_tensor1, input_tensor2], all_tensors)
@@ -241,7 +247,69 @@ def add_relu_layer(builder, input_tensor, output_tensor, all_tensors, all_opcode
     return relu_op
 
 
-def add_slice_layer(builder, input_tensor, output_tensor, slicing_key, all_tensors, all_opcodes, all_buffers):
+def add_slice_layer(builder, input_tensor, output_tensor,
+                    slicing_key, all_tensors, all_opcodes, all_buffers):
+    """
+    Adds a Slice operator (begin / size, stride == 1) to the FlatBuffer model.
+
+    Args:
+        builder: flatbuffers.Builder instance.
+        input_tensor: index of the tensor to slice.
+        output_tensor: index of the tensor that will hold the slice.
+        slicing_key: iterable of python slice objects (or ints for scalar-indexing).
+                     Example: [slice(0, 1), slice(None, 193), slice(2, 10)]
+        all_tensors / all_opcodes / all_buffers: running model lists.
+    Returns:
+        The created Slice operator.
+    """
+    begin = []
+    size  = []
+
+    for i, s in enumerate(slicing_key):
+        if isinstance(s, slice):
+            # ----- begin -----
+            b = 0 if s.start is None else s.start
+            begin.append(b)
+
+            # ----- size -----
+            if s.stop is None:
+                size.append(-1)        # -1 ⇒ “to the end” in TFLite
+            else:
+                size.append(s.stop - b)
+            # ----- stride -----
+            if s.step not in (None, 1):
+                raise ValueError("Slice with step≠1 needs StridedSlice")
+        else:
+            # Single-index → size = 1, begin = idx
+            begin.append(int(s))
+            size.append(1)
+
+    # Constant tensors for begin / size
+    for name, vec in (("slice_begin", begin), ("slice_size", size)):
+        t_idx = add_tensor(
+            builder, name,
+            np.asarray(vec, dtype=np.int32),
+            all_buffers, dtype=np.int32)
+        all_tensors.append(t_idx)
+
+    op_inputs = [input_tensor, all_tensors[-2], all_tensors[-1]]
+
+    # Slice has NO builtin options object
+    OperatorCode.Start(builder)
+    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().SLICE)
+    slice_opcode = OperatorCode.End(builder)
+
+    slice_inputs  = create_operator_inputs(builder, op_inputs, all_tensors)
+    slice_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
+
+    slice_op = add_operator(builder,
+                            slice_inputs, slice_outputs,
+                            None,  # options
+                            None,
+                            slice_opcode, all_opcodes)
+
+    return slice_op
+def add_strided_slice_layer(builder, input_tensor, output_tensor, slicing_key, all_tensors, all_opcodes, all_buffers):
     """
     Adds a StridedSlice operator to the TFLite flatbuffer model.
     
@@ -313,24 +381,30 @@ def add_slice_layer(builder, input_tensor, output_tensor, slicing_key, all_tenso
 
     return strided_slice_op
 
-def add_transpose_layer(builder, input_tensor, output_tensor, new_shape, all_tensors, all_opcodes):
+def add_transpose_layer(builder, input_tensor, output_tensor, axes_perm, all_buffers, all_tensors, all_opcodes):
     OperatorCode.Start(builder)
     OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().TRANSPOSE)
     transpose_opcode = OperatorCode.End(builder)
     
+    perm_tensor = add_tensor(builder, "perm", np.array(axes_perm,dtype=np.int32), all_buffers, dtype=np.int32)
+    all_tensors.append(perm_tensor)
     # Create inputs and outputs
-    transpose_inputs = create_operator_inputs(builder, [input_tensor], all_tensors)
+    transpose_inputs = create_operator_inputs(builder, [input_tensor, perm_tensor], all_tensors)
     transpose_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
 
     transpose_op = add_operator(builder, transpose_inputs, transpose_outputs, None, None, transpose_opcode, all_opcodes)
     return transpose_op
 
-def add_reshape_layer(builder, input_tensor, output_tensor, new_shape, all_tensors, all_opcodes):
+def add_reshape_layer(builder, input_tensor, output_tensor, new_shape, all_tensors, all_opcodes, all_buffers):
     # Create the ReshapeOptions
     ReshapeOptions.StartNewShapeVector(builder, len(new_shape))
     for dim in reversed(new_shape):
         builder.PrependInt32(dim)
     new_shape_vector = builder.EndVector()
+    op_inputs = [input_tensor]
+    reshape_tensor = add_tensor(builder, f"shape", np.array(new_shape, dtype=np.int32), all_buffers, dtype=np.int32)
+    op_inputs.append(reshape_tensor)
+    all_tensors.append(reshape_tensor)
 
     ReshapeOptions.ReshapeOptionsStart(builder)
     ReshapeOptions.ReshapeOptionsAddNewShape(builder, new_shape_vector)
@@ -342,18 +416,21 @@ def add_reshape_layer(builder, input_tensor, output_tensor, new_shape, all_tenso
     reshape_opcode = OperatorCode.End(builder)
     
     # Create inputs and outputs
-    reshape_inputs = create_operator_inputs(builder, [input_tensor], all_tensors)
+    reshape_inputs = create_operator_inputs(builder, op_inputs, all_tensors)
     reshape_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
 
-    reshape_op = add_operator(builder, reshape_inputs, reshape_outputs, reshape_options, BuiltinOptions.BuiltinOptions().ReshapeOptions, reshape_opcode, all_opcodes)
+    reshape_op = add_operator(builder, reshape_inputs, reshape_outputs, None,None, reshape_opcode, all_opcodes)
     return reshape_op
 
 def add_conv_layer(builder, input_tensor, weight_tensor, bias_tensor, output_tensor,bias_dtype,activation_op, all_tensors, all_opcodes,quax_params):
     Conv2DOptions.Start(builder)
-    #TODO - need to deal with fusion here - is here a way to do this?
-    #TODO - conv stride options
-    Conv2DOptions.AddStrideH(builder, 1)
-    Conv2DOptions.AddStrideW(builder, 1)
+
+    Conv2DOptions.AddStrideH(builder, quax_params['window_strides'][0])
+    Conv2DOptions.AddStrideW(builder, quax_params['window_strides'][1])
+
+    Conv2DOptions.AddDilationHFactor(builder, quax_params['rhs_dilation'][0])
+    Conv2DOptions.AddDilationWFactor(builder, quax_params['rhs_dilation'][1])
+
     Conv2DOptions.AddFusedActivationFunction(builder,activation_op)
     if quax_params['padding'] == 'SAME':
         padding = Padding.Padding.SAME 
@@ -478,7 +555,7 @@ def create_signature_def(builder, input_tensors, output_tensors, all_tensors, su
     signature_key = builder.CreateString("serving_default")
     input_maps = []
     for idx, tensor in enumerate(input_tensors):
-        name = f"input-{idx}"
+        name = f"input_{idx}"
         name_offset = builder.CreateString(name)
         TensorMap.TensorMapStart(builder)
         TensorMap.TensorMapAddName(builder, name_offset)
@@ -488,8 +565,8 @@ def create_signature_def(builder, input_tensors, output_tensors, all_tensors, su
 
     # Create TensorMaps for outputs
     output_maps = []
-    for tensor in output_tensors:
-        name = "output"
+    for idx, tensor in enumerate(output_tensors):
+        name = f"output_{idx}"
         name_offset = builder.CreateString(name)
         TensorMap.TensorMapStart(builder)
         TensorMap.TensorMapAddName(builder, name_offset)
