@@ -201,7 +201,8 @@ class FBB:
             scalar_qparams = make_quant_params(self.builder, scalar_qxt)
             scalar_tensor = add_tensor(self.builder, "scalar", jnp.transpose(scalar), self.buffers, quantization_params = scalar_qparams, dtype = scalar_dtype)
             #TODO - fix the scalar recording here
-            self.record_activation(quaxbegin.invars[1], scalar_tensor)
+            scalar_idx = quaxbegin.params['quax_pytree']['scalar_idx']
+            self.record_activation(quaxbegin.invars[scalar_idx], scalar_tensor)
             
         in_tensors = [self.tensor_act_map[str(x)] for x in quaxbegin.invars]
         out_var = quaxend.invars[0]

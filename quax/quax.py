@@ -114,18 +114,22 @@ class Dequantize(nn.Module):
         #this is unquantized, so we can't use the default quaxpr gen here
         store_quantized(self, 'input', qx)
         quaxpr_default(qx, self.op_type,self )
-        x = qx.x
+        #TODO - this approach of jaxpr wrapping is flawed
+        x = jnp.add(qx.x, 0)
         quaxpr_unquant_prim(x, quax_pytree)
         return x 
 
 class Quantize(nn.Module):
     bits: int
     op_type: Operation = Operation.QUANTIZE
+    to_tflite: bool = True 
 
     @nn.compact
     def __call__(self, x):
         quax_pytree = {}
         quax_pytree['op'] = self.op_type
+        quax_pytree['to_tflite'] = self.to_tflite
+
         quaxpr_unquant_prim(x, quax_pytree)
         #this is unquantized, so we can't use the default quaxpr gen here
         out_quantizer = quantizer(self.bits, po2_scaling = False)
@@ -134,7 +138,6 @@ class Quantize(nn.Module):
         qx = quantize(x, calibration_axes=[x for x in range(0, x.ndim)], q = out_quantizer, scope = self)
 
         store_quantized(self, 'output', qx)
-
         quaxpr_default(qx, self.op_type,self )
         return qx 
 
@@ -235,10 +238,10 @@ class QuaxTensor:
         return self.qx.qvalue
 
     def __sub__(self, other):
-        return self._apply_op(other, jnp.subtract, Operation.SUB)
+        return self.sub(other, jnp.subtract, Operation.SUB, rsub=False)
 
     def __rsub__(self, other):
-        return self.__sub__(other)
+        return self.sub(other, jnp.subtract, Operation.SUB, rsub=True)
 
     def __add__(self, other):
         return self._apply_op(other, jnp.add, Operation.ADD)
@@ -315,6 +318,51 @@ class QuaxTensor:
         quaxpr_default(new_qx_tensor, op_type, mdl, op_name = op_name, slice_key = new_key)
 
         return new_qx_tensor
+
+    def sub(self, other, op, op_type, rsub):
+        op_name = enrolled_model().scope.default_name("op") 
+        enrolled_model().scope.reserve(op_name)
+        op_name = f"element-{op_name}"
+        out_quantizer = quantizer(self.bits, po2_scaling = False)
+        has_scalar = False 
+        if rsub:
+            input1 = other
+            input2 = self
+        else:
+            input1 = self
+            input2 = other
+
+        if isinstance(other, QuaxTensor):
+            new_x = op(input1.x, input2.x)
+            quaxpr_multiarg(input1, input2, op=op_type, mdl=enrolled_model(), op_name = op_name, has_scalar = has_scalar)
+        elif jnp.isscalar(other):
+            has_scalar = True
+            if rsub:
+                new_x = op(input1, input2.x)
+            else:
+                new_x = op(input1.x, input2)
+
+            other = quaxtensor_from_scalar(other, self)
+            if rsub:
+                input1 = other
+            else:
+                input2 = other
+            scalar_name = f"{op_name}-scalar"
+            store_quantized(enrolled_model(), scalar_name, other)
+            quaxpr_multiarg(input1, input2, op=op_type, mdl=enrolled_model(), op_name = op_name, has_scalar = has_scalar, scalar_idx= 0 if rsub else 1)
+        else:
+            raise TypeError(f"Unsupported type for operation: {type(other)}")
+
+        #unquantized output
+        qx = quantize(new_x, calibration_axes=[y for y in range(0, new_x.ndim)], q = out_quantizer, scope = None)
+        #this is the hard part for me
+        #need to store 
+        store_quantized(enrolled_model(), op_name, qx)
+        quaxpr_default(qx, op_type, enrolled_model(), op_name = op_name)
+        return qx
+
+
+
 
     def _apply_op(self, other, op, op_type):
         op_name = enrolled_model().scope.default_name("op") 
