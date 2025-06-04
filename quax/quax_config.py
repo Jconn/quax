@@ -24,7 +24,6 @@ from aqt.jax.v2.aqt_tensor import QTensor
 from aqt.jax.v2.aqt_dot_general import MultiTensor 
 from aqt.jax.v2 import aqt_tensor
 from aqt.jax.v2.calibration import Calibration 
-from quax import aqt_quax
 
 @aqt_utils.flax_slots_kw_only_dataclass
 class InheritedCalbration(Calibration):
@@ -190,23 +189,6 @@ class OpConfig:
     enabled: bool
     calib_shared_axes: int = -1
 
-    def dot_general(self):
-
-        if self.enabled:
-            aqt_bit_cfg =  quantized_dg_cfg(lhs_bits=self.lhs_bits,rhs_bits=self.rhs_bits, bwd_bits=self.lhs_bits)
-            dg = functools.partial(
-              aqt_quax.QuaxDotGeneral,
-              #aqt_flax.AqtDotGeneral,
-              aqt_bit_cfg, 
-              lhs_quant_mode=aqt_utils.QuantMode.TRAIN,
-              rhs_quant_mode=aqt_utils.QuantMode.TRAIN,
-              lhs_freeze_mode=aqt_flax.FreezerMode.CALIBRATION,
-              rhs_freeze_mode=aqt_flax.FreezerMode.CALIBRATION_AND_VALUE,
-            )
-            dg = dg()
-        else:
-            dg = lax.dot_general
-        return dg
     def conv_general_dilated(self): 
         if self.enabled:
             #reusing dg config for conv for now..
