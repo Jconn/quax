@@ -20,6 +20,7 @@ from quax.quax import Operation, AppendedActivation, ActivationType
 from quax.quax_utils import bits_to_type 
 import numpy as np
 from quax.quaxpr import QUAXPR_NAME
+import copy
 
 def parse_quaxprs(model_jaxpr):
     quaxprs = []
@@ -28,22 +29,31 @@ def parse_quaxprs(model_jaxpr):
             quaxprs.append(eqn)
     return quaxprs
 
+def correct_bias_scale(in_qxt, weight_qxt, bias_qxt):
+    in_scale = in_qxt.scale
+    weight_scale = weight_qxt.scale
+    bias_scale = np.squeeze(in_scale * weight_scale)
+    bias_scale = jnp.broadcast_to(bias_scale, bias_qxt.scale.shape)
+    new_bias_qxt = copy.deepcopy(bias_qxt)
+    new_bias_qxt.scale = bias_scale
+    return new_bias_qxt
+
+
+def quantized_weights(qx):
+    return qx.quantized_tensor()
 
 def make_quant_params(builder, qxt):
-    aqt_weights = qxt.qx
-    weight = aqt_weights.qvalue
-    weight_scale = aqt_weights.scale[0]
-    #TODO - why are we indexing into weight scale
-    #dequantized_weights = weight * weight_scale[0]
-    dequantized_weights = weight * np.squeeze(weight_scale)
+    weight_scale = qxt.scale
+    dequantized_weights = qxt.x 
     target_shape = weight_scale.shape
     reduce_axes = tuple(i for i, (d1, d2) in enumerate(zip(dequantized_weights.shape, target_shape)) if d1 != d2)
     weight_mins = jnp.min(dequantized_weights, axis=reduce_axes, keepdims=True)
     weight_maxs = jnp.max(dequantized_weights, axis=reduce_axes, keepdims=True)
 
     #need to find the algorithm that matches the mins to the scales
-    #TODO - aqt has no zero point quant support
-    weight_zero_point = jnp.zeros(weight_scale.shape, dtype=np.int32)
+    #TODO - weight zp is always zero
+    weight_zero_point = qxt.zero_point
+
     weight_qparams = add_quantization_params(builder, weight_mins, weight_maxs, weight_scale, weight_zero_point, quantized_dim = 0)
     return weight_qparams
         
@@ -169,7 +179,7 @@ class FBB:
         return weight_path, quax_path
 
     def make_empty_tensor(self, qxt, out_var):
-        scale = qxt.qx.scale[0] 
+        scale = qxt.scale 
         zero_point = self.parse_zp(qxt)
         dtype = bits_to_type(qxt.bits) 
         shape = out_var.aval.shape
@@ -337,21 +347,12 @@ class FBB:
         else:
             raise Exception(f"couldn't find activation tensor with key {act_key}")
         if has_bias:
-            bias_weight = bias_qxt.unquantized_tensor()
-            #need to quantize this to the same scale as our accum
-            #how does one do that - we have the scale of the weight and the input data
-            #multiply the scales together, and quantize the values
-            in_scale = in_qxt.qx.scale[0]
-            weight_scale = weight_qxt.qx.scale[0]
-            bias_scale = np.squeeze(in_scale * weight_scale)
-            bias_weight = np.squeeze(bias_weight)
+            corrected_bias_qxt  = correct_bias_scale(in_qxt, weight_qxt, bias_qxt)
+            #TODO - no zero point in bias
+            corrected_bias_qweight = np.array((corrected_bias_qxt.x/corrected_bias_qxt.scale), dtype=bias_dtype)
 
-            new_bias_weight = np.array((bias_weight/bias_scale), dtype=bias_dtype)
-
-            bias_qxt.qx.scale = bias_scale 
-
-            bias_qparams = make_quant_params(self.builder, bias_qxt)
-            bias_tensor = add_tensor(self.builder, "bias", new_bias_weight, self.buffers, quantization_params = bias_qparams, dtype = bias_dtype)
+            bias_qparams = make_quant_params(self.builder, corrected_bias_qxt)
+            bias_tensor = add_tensor(self.builder, "bias", corrected_bias_qweight, self.buffers, quantization_params = bias_qparams, dtype = bias_dtype)
             self.record_weight(bias_tensor)
         
 
@@ -416,24 +417,13 @@ class FBB:
         self.record_weight(weight_tensor)
         
         if has_bias:
-            bias_weight = bias_qxt.unquantized_tensor()
-            #need to quantize this to the same scale as our accum
-            #how does one do that - we have the scale of the weight and the input data
-            #multiply the scales together, and quantize the values
-            in_scale = in_qxt.qx.scale[0]
-            weight_scale = weight_qxt.qx.scale[0]
-            bias_scale = np.squeeze(in_scale * weight_scale)
-            bias_weight = np.squeeze(bias_weight)
+            corrected_bias_qxt  = correct_bias_scale(in_qxt, weight_qxt, bias_qxt)
+            #TODO - no zero point in bias
+            corrected_bias_qweight = np.array((corrected_bias_qxt.x/corrected_bias_qxt.scale), dtype=bias_dtype)
 
-            new_bias_weight = np.array((bias_weight/bias_scale), dtype=bias_dtype)
-
-            bias_qxt.qx.scale = [bias_scale]
-            
-            bias_qparams = make_quant_params(self.builder, bias_qxt)
-            bias_tensor = add_tensor(self.builder, "bias", new_bias_weight, self.buffers, quantization_params = bias_qparams, dtype = bias_dtype)
+            bias_qparams = make_quant_params(self.builder, corrected_bias_qxt)
+            bias_tensor = add_tensor(self.builder, "bias", corrected_bias_qweight, self.buffers, quantization_params = bias_qparams, dtype = bias_dtype)
             self.record_weight(bias_tensor)
-            #TODO -recording weight?
-            #self.record_weight(bias_var, bias_tensor)
         
         #record the output tensor
 
@@ -460,9 +450,7 @@ class FBB:
        
 
     def parse_zp(self, quaxtensor):
-        #soon zeropoint support..
-        out_scale = quaxtensor.qx.scale[0]
-        out_zp = jnp.zeros(out_scale.shape, dtype=np.int32)
+        out_zp = quaxtensor.zero_point 
         return out_zp
 
     def dequant_handler(self, quaxbegin, quaxend):

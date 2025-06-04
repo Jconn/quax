@@ -13,6 +13,7 @@
 # limitations under the License.
 """Mnist example."""
 import os
+import argparse
 #os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
 #os.environ['CUDA_VISIBLE_DEVICES'] = "-1" 
 import copy
@@ -44,60 +45,28 @@ from quax.jax2tflite import FBB
 from quax.quax import QDense, Quantize, QConv, enroll_model, Dequantize, GRUCell
 from quax import quax
 import orbax.checkpoint as ocp
+from pathlib import Path
 
 class CNN(nn.Module):
     @nn.compact
     def __call__(self, x, recurrent):
         enroll_model(self)
-        act_bits = 16 
+        act_bits =8
         weight_bits = 8
-        bias = True 
-        #x = Quantize(bits=act_bits, quantized = self.quantized)(x)
-        #x = QConv(features=32, kernel_size=(3, 3), lhs_bits = act_bits, rhs_bits = weight_bits, quantized= self.quantized, act_fn = nn.relu, use_bias = bias)(x)
-        #x = QConv(features=64, kernel_size=(3, 3), lhs_bits = act_bits, rhs_bits = weight_bits,quantized=self.quantized, act_fn = nn.relu, use_bias = bias)(x)
-        #x = quax.reshape((x.shape[0], -1), x)
-        #x = QDense(features=256, lhs_bits = act_bits, rhs_bits = weight_bits, quantized = self.quantized, act_fn = nn.relu, use_bias = bias)(x)
-        #x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, quantized = self.quantized, use_bias = bias)(x)
-        #if self.quantized: 
-        #    x = x.dequant()
-
-        use_running_avg = False
-        #x = QConv(features=2, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
-        #x = nn.Conv(features=32, kernel_size=(3,3), use_bias = True, padding='VALID')(x)
-        #x = nn.relu(x)
-        #x = x.reshape(x.shape[0], -1)
-        #x = nn.Dense(features=256, use_bias = bias)(x)
-        #x = nn.Dense(features=256, use_bias = bias)(x)
-        #x = nn.relu(x)
-        #x = nn.Dense(features=10, use_bias = bias)(x)
+        bias = False 
         x = Quantize(bits=act_bits)(x)
-        #x = quax.concatenate([x,x,x], axis=-1)
-        recurrent = Quantize(bits=act_bits, to_tflite=False)(recurrent)
-
-        #x = quax.concatenate([x,x,x], axis=-1)
-        #x = x.transpose((0,2,1,3))
-        x = QConv(features=8, strides=(1,2), kernel_size=(1,3), lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = True, padding='SAME')(x)
-        x = quax.tanh(x, out_bits=act_bits)
+        #TODO - why does this go unstable at stride (1,1)
+        x = QConv(features=8, strides=(1,2), kernel_size=(1,3), lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = True, padding='VALID')(x)
         x = QConv(features=16, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
-        #x = QConv(features=32, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
-        #x = x[...,:8]
+        #x = x + x
+        x = QConv(features=10, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
         x = x.reshape((x.shape[0], -1))
-        #x = QDense(features=512,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
-        #x = x[:,100:]
-        x = quax.concatenate([x,x], axis=1, requant=False)
-        #x = x * y 
-        #x = x - y
-        #x = quax.concatenate([x,y], axis=1)
-        #x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias)(x)
-        #x = Dequantize()(x)
-        x,rec_x = GRUCell(lhs_bits=act_bits, rhs_bits=weight_bits)(recurrent,x)
-        x = QDense(features=256,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
-        y = QDense(features=256,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
-        x = x * quax.sigmoid(y, out_bits = act_bits)
-        x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
-        #x = out_x + rec_x
+        x = QDense(features=400,lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = bias)(x)
+        x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias)(x)
+
+        #x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
         x = Dequantize()(x)
-        return x, rec_x
+        return x, x 
 
 @functools.partial(jax.jit, static_argnums=(3,))
 def apply_model(model_params, images, labels, apply_fn):
@@ -116,7 +85,7 @@ def apply_model(model_params, images, labels, apply_fn):
     return loss, (logits, updated_var)
   grad_fn = jax.value_and_grad(loss_fn, has_aux=True, allow_int=True)
   aux, grads = grad_fn(model_params)
-  #grads['params']['Conv_0']['kernel']
+  #grads['params']['QDense_0']['kernel']
   loss, (logits, updated_var) = aux
   accuracy = jnp.mean(jnp.argmax(logits, -1) == labels)
   return grads, loss, accuracy, updated_var
@@ -197,7 +166,10 @@ class TrainState(struct.PyTreeNode):
 def create_train_state(rng):
   """Creates initial `TrainState`."""
   cnn_train = CNN()
-  model = cnn_train.init({'params': rng}, jnp.ones([1, 28, 28, 1]), jnp.ones([1,10]))
+  batch_size = 128
+
+  with jax.check_tracer_leaks():
+      model = cnn_train.init({'params': rng}, jnp.ones([batch_size, 28, 28, 1]), jnp.ones([1,10]))
   learning_rate = 0.1
   momentum = 0.9
   tx = optax.sgd(learning_rate, momentum)
@@ -452,7 +424,6 @@ def test_translate(tflite_model, state, weight_only: bool = True):
   mlogits, jax_rnn = inf
   tfl_loss = jnp.mean(optax.softmax_cross_entropy(logits=out_logs, labels=one_hot))
   jax_loss = jnp.mean(optax.softmax_cross_entropy(logits=mlogits, labels=one_hot))
-  import pdb; pdb.set_trace()
   if jnp.abs(jax_loss - tfl_loss) > .05:
       raise Exception(f"tflite jax loss differs - tfl; {tfl_loss}, jax - {jax_loss}")
   else:
@@ -465,14 +436,13 @@ def tflite_invoke(interpreter, float_input):
     interpreter.allocate_tensors()
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
-    input_index = input_details[1]['index']
-    recurrent_index = input_details[0]['index']
+    input_index = input_details[0]['index']
 
 
 
 
     # Read quantization parameters
-    quantization_params = input_details[1]['quantization']  # (scale, zero_point)
+    quantization_params = input_details[0]['quantization']  # (scale, zero_point)
     scale, zero_point = quantization_params
 
     # Quantize the float input to int16
@@ -483,7 +453,6 @@ def tflite_invoke(interpreter, float_input):
     #interpreter.set_tensor(0,input_index)
 
     interpreter.set_tensor(input_index, quantized_input)
-    interpreter.set_tensor(recurrent_index, jnp.ones([1,10]))
     # Run inference
     interpreter.invoke()
     # Get the output
@@ -497,19 +466,40 @@ def tflite_invoke(interpreter, float_input):
         output_data = (output_data.astype(np.float32) - output_zero_point) * output_scale
     return output_data, rnn_output
 
-def main(argv):
-  del argv
+def main():
+    # Parse command line arguments
+  parser = argparse.ArgumentParser()
+  parser.add_argument('--load_weights', type=str, default=None, help='Path to model weights to load (Orbax checkpoint directory)')
+  args = parser.parse_args()
 
-  # 1. TRAIN.
+  ckpt_root   = Path("checkpoints")
+  ckpt_root.mkdir(parents=True, exist_ok=True)
+  step = 1 # use a single tag here it's not important
+  while (ckpt_root / str(step)).exists():
+      step += 1
+  ckpt_path = ckpt_root / str(step)
+  ckpt_path = ckpt_path.resolve()
+  checkpointer = ocp.StandardCheckpointer()
 
-  state = train_and_evaluate(
-      num_epochs=3, workdir='/tmp/aqt_mnist_example')
+  # 1. TRAIN or LOAD.
+  if args.load_weights is not None:
+      print(f"Loading model weights from {args.load_weights} using Orbax")
+      ckpt_path = Path(args.load_weights).resolve()
+      save_state = create_train_state(jax.random.key(0)) 
+      abstract = jax.tree_map(ocp.utils.to_shape_dtype_struct, save_state)
+      state = checkpointer.restore(ckpt_path, target=abstract)
+  else:
+      state = train_and_evaluate(
+              num_epochs=1, workdir='/tmp/aqt_mnist_example')
+      # Save weights using Orbax after training
 
-  
+      checkpointer.save(ckpt_path, state)
+      print("saved orbax ckpt")
+
   x = jnp.ones([1, 28, 28, 1])
   converter = FBB()
   with jax.disable_jit():
-      tflite = converter.convert(state.cnn_train, state.model, x=x,recurrent = jnp.ones([1,10]))
+      tflite = converter.convert(state.cnn_train, state.model, x=x, recurrent=jnp.ones([1,10]))
   with open('mnist_quax.tflite', 'wb') as f:
       f.write(tflite)
 
@@ -517,4 +507,4 @@ def main(argv):
 
   #(Pdb) serving_model['aqt']['Conv_1']['AqtConvGeneralDilated_0']['qrhs']
 if __name__ == '__main__':
-    app.run(main)
+    main()
