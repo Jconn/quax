@@ -58,8 +58,10 @@ class CNN(nn.Module):
 
         x = QConv(features=8, strides=(1,2), kernel_size=(1,3), lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = True, padding='SAME')(x)
         x = QConv(features=16, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+        x = QConv(features=10, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
         x = x.reshape((x.shape[0], -1))
         x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
+        #x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
         x = Dequantize()(x)
         return x, x 
 
@@ -80,7 +82,7 @@ def apply_model(model_params, images, labels, apply_fn):
     return loss, (logits, updated_var)
   grad_fn = jax.value_and_grad(loss_fn, has_aux=True, allow_int=True)
   aux, grads = grad_fn(model_params)
-  #grads['params']['Conv_0']['kernel']
+  #grads['params']['QDense_0']['kernel']
   loss, (logits, updated_var) = aux
   accuracy = jnp.mean(jnp.argmax(logits, -1) == labels)
   return grads, loss, accuracy, updated_var
@@ -162,7 +164,9 @@ def create_train_state(rng):
   """Creates initial `TrainState`."""
   cnn_train = CNN()
   batch_size = 128
-  model = cnn_train.init({'params': rng}, jnp.ones([batch_size, 28, 28, 1]), jnp.ones([1,10]))
+
+  with jax.check_tracer_leaks():
+      model = cnn_train.init({'params': rng}, jnp.ones([batch_size, 28, 28, 1]), jnp.ones([1,10]))
   learning_rate = 0.1
   momentum = 0.9
   tx = optax.sgd(learning_rate, momentum)
@@ -417,7 +421,6 @@ def test_translate(tflite_model, state, weight_only: bool = True):
   mlogits, jax_rnn = inf
   tfl_loss = jnp.mean(optax.softmax_cross_entropy(logits=out_logs, labels=one_hot))
   jax_loss = jnp.mean(optax.softmax_cross_entropy(logits=mlogits, labels=one_hot))
-  import pdb; pdb.set_trace()
   if jnp.abs(jax_loss - tfl_loss) > .05:
       raise Exception(f"tflite jax loss differs - tfl; {tfl_loss}, jax - {jax_loss}")
   else:
@@ -482,7 +485,7 @@ def main():
       state = checkpointer.restore(ckpt_path, target=abstract)
   else:
       state = train_and_evaluate(
-              num_epochs=1, workdir='/tmp/aqt_mnist_example')
+              num_epochs=4, workdir='/tmp/aqt_mnist_example')
       # Save weights using Orbax after training
       checkpointer.save(ckpt_path, state)
       print("saved orbax ckpt")
@@ -499,4 +502,5 @@ def main():
 
   #(Pdb) serving_model['aqt']['Conv_1']['AqtConvGeneralDilated_0']['qrhs']
 if __name__ == '__main__':
-    main()
+    with jax.disable_jit():
+        main()
