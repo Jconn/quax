@@ -51,16 +51,17 @@ class CNN(nn.Module):
     @nn.compact
     def __call__(self, x, recurrent):
         enroll_model(self)
-        act_bits = 16 
+        act_bits = 8
         weight_bits = 8
-        bias = True 
+        bias = False 
         x = Quantize(bits=act_bits)(x)
-
+        #TODO - why does this go unstable at stride (1,1)
         x = QConv(features=8, strides=(1,2), kernel_size=(1,3), lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = True, padding='SAME')(x)
         x = QConv(features=16, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
         x = QConv(features=10, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
         x = x.reshape((x.shape[0], -1))
-        x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
+        x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias)(x)
+
         #x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
         x = Dequantize()(x)
         return x, x 
@@ -472,6 +473,8 @@ def main():
   ckpt_root   = Path("checkpoints")
   ckpt_root.mkdir(parents=True, exist_ok=True)
   step = 1 # use a single tag here it's not important
+  while (ckpt_root / str(step)).exists():
+      step += 1
   ckpt_path = ckpt_root / str(step)
   ckpt_path = ckpt_path.resolve()
   checkpointer = ocp.StandardCheckpointer()
@@ -485,12 +488,12 @@ def main():
       state = checkpointer.restore(ckpt_path, target=abstract)
   else:
       state = train_and_evaluate(
-              num_epochs=4, workdir='/tmp/aqt_mnist_example')
+              num_epochs=1, workdir='/tmp/aqt_mnist_example')
       # Save weights using Orbax after training
+
       checkpointer.save(ckpt_path, state)
       print("saved orbax ckpt")
 
-  import pdb; pdb.set_trace()
   x = jnp.ones([1, 28, 28, 1])
   converter = FBB()
   with jax.disable_jit():
@@ -502,5 +505,4 @@ def main():
 
   #(Pdb) serving_model['aqt']['Conv_1']['AqtConvGeneralDilated_0']['qrhs']
 if __name__ == '__main__':
-    with jax.disable_jit():
-        main()
+    main()

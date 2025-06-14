@@ -55,10 +55,13 @@ class PassthroughCalibrator(Calibrator):
 
 @aqt_utils.flax_slots_kw_only_dataclass
 class AbsMaxCalibrator(Calibrator):
+    use_zp: bool = None
     def calibrate(self, qx, x):
-        default_calibrator = calibrator_from_bits(qx.bits)
-        return default_calibrator(qx, x)
-
+        if self.use_zp is None:
+            default_calibrator = calibrator_from_bits(qx.bits)
+            return default_calibrator(qx, x)
+        else:
+            return min_max_calibrator(qx, x, use_zp = self.use_zp)
 
 
 
@@ -79,13 +82,17 @@ def default_16bit_calibrator(qx, x):
 def min_max_calibrator(qx, x, use_zp = False):
     if use_zp:
         zp = jnp.mean(x, axis=qx.calibration_axes, keepdims=True)
+        zp = jnp.zeros([1], dtype = x.dtype)
     else:
         zp = jnp.zeros([1], dtype = x.dtype)
     adjusted_x = x - zp
     abs_max = jnp.max(jnp.abs(adjusted_x), axis=qx.calibration_axes, keepdims=True)
     bound = abs_max
+    bound = jnp.where(bound == 0.0, jnp.ones_like(bound), bound)
     scale = bound / qx.qx_numerics.get_quant_bound()
+
     scale = ceil_to_po2(scale) if qx.po2_scaling else scale
+    #TODO - fix zero point usage
     #zp = jnp.array([zp], dtype=scale.dtype)
     return scale, zp 
 
