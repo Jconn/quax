@@ -85,17 +85,27 @@ def min_max_calibrator(qx, x, use_zp = False):
     #    zp = jnp.zeros([1], dtype = x.dtype)
     #else:
     #    zp = jnp.zeros([1], dtype = x.dtype)
+    max_val = jnp.max(x, axis=qx.calibration_axes, keepdims=True)
+    min_val = jnp.min(x, axis=qx.calibration_axes, keepdims=True)
+    mid_point = (max_val + min_val)/2
+    if use_zp:
+        x = x - mid_point
     abs_max = jnp.max(jnp.abs(x), axis=qx.calibration_axes, keepdims=True)
+
     bound = abs_max
     bound = jnp.where(bound == 0.0, jnp.ones_like(bound), bound)
     scale = bound / qx.qx_numerics.get_quant_bound()
 
     scale = ceil_to_po2(scale) if qx.po2_scaling else scale
     #TODO - zp 
-    zp = jnp.zeros(scale.shape)
+    if use_zp:
+        zp = mid_point / scale
+        zp = zp.astype(jnp.int8)
+    else:
+        zp = jnp.zeros(scale.shape)
     #TODO - fix zero point usage
     #zp = jnp.array([zp], dtype=scale.dtype)
-    return scale, zp 
+    return scale, -zp 
 
 def passthrough(qx, x):
     return qx.scale, qx.zp 

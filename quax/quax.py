@@ -240,6 +240,11 @@ def inherit_quaxtensor(qx):
 
 @aqt_utils.flax_slots_kw_only_dataclass
 class QuaxTensor:
+    '''
+    note: zero point usage kind of messes up the integer numerics 
+    because everything is given an extra bit of precision.
+    zero point inclusion will have to be addressed at some point
+    '''
     x: jnp.ndarray
     bits: int
     calibration_axes: Sequence[int]
@@ -262,18 +267,20 @@ class QuaxTensor:
         return x, quant_grad
     
     def quant(self, x):
-        #quant(x) = (x + b) /s
+        #quant(x) = (x/s + b)
         qvalue = x
-        qvalue = qvalue + self.zero_point
+        qvalue = qvalue
         s_inv = jax.lax.reciprocal(self.scale)
         s_inv = jnp.where(jnp.isinf(s_inv), jnp.ones_like(s_inv), s_inv)
         qvalue *= s_inv
+        #qvalue += self.zero_point
         return qvalue
 
     def dequant(self, qvalue):
-        #dequant(x) = x*s - b
-        x = qvalue * self.scale
-        x -= self.zero_point
+        #dequant(x) = (x -b) * s 
+        #x = qvalue - self.zero_point
+        x = qvalue
+        x *= self.scale
         return x
 
     @property 
