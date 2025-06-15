@@ -80,18 +80,19 @@ def default_16bit_calibrator(qx, x):
     return min_max_calibrator(qx, x, use_zp = False)
 
 def min_max_calibrator(qx, x, use_zp = False):
-    if use_zp:
-        zp = jnp.mean(x, axis=qx.calibration_axes, keepdims=True)
-        zp = jnp.zeros([1], dtype = x.dtype)
-    else:
-        zp = jnp.zeros([1], dtype = x.dtype)
-    adjusted_x = x - zp
-    abs_max = jnp.max(jnp.abs(adjusted_x), axis=qx.calibration_axes, keepdims=True)
+    #if use_zp:
+    #    zp = jnp.mean(x, axis=qx.calibration_axes, keepdims=True)
+    #    zp = jnp.zeros([1], dtype = x.dtype)
+    #else:
+    #    zp = jnp.zeros([1], dtype = x.dtype)
+    abs_max = jnp.max(jnp.abs(x), axis=qx.calibration_axes, keepdims=True)
     bound = abs_max
     bound = jnp.where(bound == 0.0, jnp.ones_like(bound), bound)
     scale = bound / qx.qx_numerics.get_quant_bound()
 
     scale = ceil_to_po2(scale) if qx.po2_scaling else scale
+    #TODO - zp 
+    zp = jnp.zeros(scale.shape)
     #TODO - fix zero point usage
     #zp = jnp.array([zp], dtype=scale.dtype)
     return scale, zp 

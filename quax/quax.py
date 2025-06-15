@@ -177,7 +177,14 @@ def requantize_op(x, scale):
 
 def quantize(x, qx=None, **kwargs):
     assert isinstance(x, jnp.ndarray), "x must be jnp array"
+
+    if kwargs.get('calibration_axes') is None:
+      #if not specified, assume single quantization for entire tensor
+      calibration_axes = [x for x in range(0, x.ndim)]
+      kwargs['calibration_axes'] = calibration_axes
+
     if qx is None:
+
       if kwargs.get('qx_numerics') is None:
         default_numerics = numerics.int_numerics.IntSymmetric(bits=kwargs.get('bits'),
                                                               preserve_zero=True,
@@ -190,6 +197,9 @@ def quantize(x, qx=None, **kwargs):
       qx = QuaxTensor(x=x, **kwargs)
     else:
       qx = inherit_quaxtensor(qx)
+    #override calibration axes to make sure prior value isn't actually
+    #TODO - remove calibration_axes from tensor, or maybe crush it when a reshape, etc. occurs
+    qx.calibration_axes = kwargs.get('calibration_axes')
 
     #don't trace calibration step since it isn't gradient effected
     qx.calibrate(x)
@@ -444,7 +454,6 @@ class QuaxTensor:
             #need to store the scalar for later still
             store_quantized(enrolled_model(), scalar_name, other)
             #TODO -need to store a quax quantized
-            #import pdb; pdb.set_trace()
             quaxpr_multiarg(self, other, op=op_type, mdl=enrolled_model(), op_name = op_name, has_scalar = has_scalar)
         else:
             raise TypeError(f"Unsupported type for operation: {type(other)}")
@@ -731,7 +740,6 @@ class QDense(nn.Module):
         else:
           bias = None
         #TODO -look at speedups from quantized vectors 
-        #import pdb; pdb.set_trace()
         y = lax.dot_general(
           x.x,
           kernel.x,
@@ -951,7 +959,7 @@ class QConv(nn.Module):
 
 
 
-    kernel = quantize(kernel, calibration_axes=[_ for _ in range(0, kernel.ndim)],
+    kernel = quantize(kernel, calibration_axes=[_ for _ in range(0, kernel.ndim-1)],
                   bits = self.rhs_bits,
                   calibrator = AbsMaxCalibrator(use_zp =False),
                   po2_scaling = False)
@@ -966,7 +974,7 @@ class QConv(nn.Module):
         bias_shape = conv_output_shape[1:]
 
       bias = self.param('bias', self.bias_init, bias_shape, self.param_dtype)
-      bias = quantize(bias, calibration_axes=[_ for _ in range(0, bias.ndim)],
+      bias = quantize(bias, calibration_axes=[_ for _ in range(0, bias.ndim-1)],
                     bits = 16,
                     calibrator = quantizer.AbsMaxCalibrator(use_zp=False),
                     po2_scaling = False)
