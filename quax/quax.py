@@ -22,6 +22,7 @@ from aqt.jax.v2.aqt_tensor import QTensor
 from jax.interpreters import ad
 from aqt.jax.v2 import aqt_tensor
 from quax.quantizer import Calibrator, PassthroughCalibrator, AbsMaxCalibrator
+from quax import tflite_numerics
 from functools import partial
 import logging
 from flax.typing import (
@@ -40,7 +41,81 @@ from flax.typing import (
 )
 
 import copy
-model_enroll = None
+
+
+import contextlib, contextvars
+_current_model = contextvars.ContextVar("current_model", default=None)
+_base_model = contextvars.ContextVar("base_model", default=None)
+
+@contextlib.contextmanager
+def model_context(model):
+    cur_token = _current_model.set(model)
+    if _base_model.get() is None:
+        base_token = _base_model.set(model)
+    try:
+        yield model
+    finally:
+        _current_model.reset(cur_token)
+        if model == _base_model.get():
+            if base_token is not None:
+                _base_model.reset(base_token)
+
+def enrolled_model():
+    return _current_model.get()
+
+def base_model():
+    return _base_model.get()
+
+class QModule(nn.Module):
+    train_quant: bool = field(default=None, kw_only=True) # ← magic
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+        # Skip subclasses that already wrapped themselves.
+        if getattr(cls, "_qmodule_patched", False):
+            return
+
+        orig_call = cls.__call__                         # user-defined @nn.compact
+        def _wrapped(self, *args, **kwargs):
+            #inherit parent train_quant if we don't have one
+            with model_context(self):
+                return orig_call(self, *args, **kwargs)
+
+        cls.__call__ = _wrapped
+        cls._qmodule_patched = True      # avoid double-wrapping
+
+    def get_tq(self):
+        if self.train_quant is None:
+            tq = base_model().train_quant
+        else:
+            tq = self.train_quant
+        assert tq is not None, "base model train quant must be set"
+        return tq
+
+    def store_activation(self, name, qxtensor):
+        self.store_quantized(name, qxtensor,scale_only=True)
+    
+    def store_weight(self, name, qxtensor):
+        self.store_quantized(name, qxtensor,scale_only=False)
+
+    def get_quantized(self, name):
+        if self.has_variable('quax', name):
+            return self.get_variable('quax', name)
+        else:
+            raise Exception("quax variable not found: " + name)
+
+
+    def store_quantized(self, name, qxtensor,scale_only=False):
+        init_fn = lambda: 0
+        reduce_fn = lambda a, b:  b
+        #will return true if the store succeeds
+        #will fail by default when no longer mutable
+        qxcopy = qxtensor
+        if scale_only:
+            qxcopy = copy.deepcopy(qxcopy)
+            qxcopy.x = None 
+        return self.sow('quax', name, qxcopy,
+                  init_fn=init_fn, reduce_fn=reduce_fn)
 
 def quaxtensor_from_scalar(scalar , qx):
     array = jnp.array(scalar)
@@ -60,27 +135,7 @@ def zeros(shape, bits):
     quaxt = QuaxTensor(x = x, qx = qx, bits = bits)
     return quaxt
 
-def enroll_model(mdl):
-    global model_enroll
-    model_enroll = mdl
 
-def enrolled_model():
-    return model_enroll
-
-def store_activation(mdl, name, qxtensor):
-    store_quantized(mdl, name, qxtensor,scale_only=True)
-
-def store_quantized(mdl, name, qxtensor,scale_only=False):
-    init_fn = lambda: 0
-    reduce_fn = lambda a, b:  b
-    #will return true if the store succeeds
-    #will fail by default when no longer mutable
-    qxcopy = qxtensor
-    if scale_only:
-        qxcopy = copy.deepcopy(qxcopy)
-        qxcopy.x = None 
-    return mdl.sow('quax', name, qxcopy,
-                  init_fn=init_fn, reduce_fn=reduce_fn)
 
 
 default_kernel_init = initializers.lecun_normal()
@@ -106,26 +161,28 @@ def marker_jvp(primals, tangents, **params):
 
 ad.defjvp(marker_p, marker_jvp)
 
-class Dequantize(nn.Module):
+class Dequantize(QModule):
     '''
     this takes as input a quaxtensor
     returns a numpy tensor
     '''
     op_type: Operation = Operation.DEQUANTIZE
+    to_tflite: bool = True
 
     @nn.compact
     def __call__(self, qx):
         quax_pytree = {}
         quax_pytree['op'] = self.op_type
+        quax_pytree['to_tflite'] = self.to_tflite
         #this is unquantized, so we can't use the default quaxpr gen here
-        store_activation(self, 'input', qx)
+        self.store_activation('input', qx)
         quaxpr_default(qx, self.op_type,self )
         #TODO - this approach of jaxpr wrapping is flawed
         x = jnp.add(qx.x, 0)
         quaxpr_unquant_prim(x, quax_pytree)
         return x 
 
-class Quantize(nn.Module):
+class Quantize(QModule):
     bits: int
     op_type: Operation = Operation.QUANTIZE
     to_tflite: bool = True 
@@ -138,14 +195,13 @@ class Quantize(nn.Module):
 
         quaxpr_unquant_prim(x, quax_pytree)
 
-        qx = quantize(x, calibration_axes=[x for x in range(0, x.ndim)],
+
+        qx = quantize(x, self, 'output', is_activation=True, calibration_axes=[x for x in range(0, x.ndim)],
                       bits = self.bits,
                       calibrator = quantizer.AbsMaxCalibrator(),
                       po2_scaling = False)
 
-
-        store_activation(self, 'output', qx)
-        quaxpr_default(qx, self.op_type,self )
+        quaxpr_default(qx, self.op_type,self, to_tflite=self.to_tflite)
         return qx 
 
 def requantize_op(x, scale):
@@ -175,7 +231,9 @@ def requantize_op(x, scale):
     #quaxt = QuaxTensor(x = x, qx = qx, bits = q.numerics.bits)
     return qxt 
 
-def quantize(x, qx=None, **kwargs):
+def quantize(x, mdl, name, is_activation, qx=None, **kwargs):
+    train_quant = mdl.get_tq()
+
     assert isinstance(x, jnp.ndarray), "x must be jnp array"
 
     if kwargs.get('calibration_axes') is None:
@@ -184,15 +242,11 @@ def quantize(x, qx=None, **kwargs):
       kwargs['calibration_axes'] = calibration_axes
 
     if qx is None:
-
       if kwargs.get('qx_numerics') is None:
-        default_numerics = numerics.int_numerics.IntSymmetric(bits=kwargs.get('bits'),
-                                                              preserve_zero=True,
-                                                              preserve_max_val=True,
+        default_numerics = tflite_numerics.IntAsymmetric(bits=kwargs.get('bits'),
                                                               clip=True,
                                                               clip_gradient=True,
-                                                              round=True,
-                                                              noise_fn = None)
+                                                              )
         kwargs['qx_numerics'] = default_numerics
       qx = QuaxTensor(x=x, **kwargs)
     else:
@@ -201,10 +255,15 @@ def quantize(x, qx=None, **kwargs):
     #TODO - remove calibration_axes from tensor, or maybe crush it when a reshape, etc. occurs
     qx.calibration_axes = kwargs.get('calibration_axes')
 
+    
     #don't trace calibration step since it isn't gradient effected
-    qx.calibrate(x)
-    #scale, zp = qx.calibrator.calibrate(qx, x)
-    #qx = qx.replace(scale=jax.lax.stop_gradient(scale), zero_point=jax.lax.stop_gradient(zp))
+    if train_quant:
+        qx.calibrate(x)
+    else:
+        stored_qx = mdl.get_quantized(name)
+        qx = qx.replace(scale=stored_qx.scale, zero_point=stored_qx.zero_point)
+
+
     @jax.custom_vjp
     def quant(x):
         x, grad = qx.fake_quant(x)
@@ -217,10 +276,13 @@ def quantize(x, qx=None, **kwargs):
     def quant_bwd(res, g):
         quant_grad = res
         return quant_grad(g)[0],
+    
 
     quant.defvjp(quant_fwd, quant_bwd)
     x = quant(x)
     qx = qx.replace(x=x) 
+    if train_quant:
+        mdl.store_quantized(name, qx, scale_only=is_activation)
     return qx
 
 def is_quantized(x):
@@ -260,8 +322,13 @@ class QuaxTensor:
 
     def fake_quant(self, orig_x):
         qx = self.quant(orig_x)
-        #TODO - do I keep the gradients alive?
+        #TODO - I suspect the numerics needs to include an extra bit of tolerance when zero point is used
+        #the quantized value here represents the real value with zero point already factored in
+        qx += self.zero_point
+        #TODO - it seems like tflite scaling is asymmetric [-128, 127] for int8
+        #but aqt scaling is symmetric [-127, 127], causes an off by one. Need to look more into it
         x_q, res = self.qx_numerics.vjp_fwd(qx, context=None)
+        x_q -= self.zero_point
         quant_grad = jax.tree_util.Partial(self.qx_numerics.vjp_bwd, res)
         x = self.dequant(x_q)
         return x, quant_grad
@@ -316,7 +383,9 @@ class QuaxTensor:
         return self.x
 
     def quantized_tensor(self):
-        return self.quant(self.x)
+        x_q = self.quant(self.x)
+        x_q,_ = self.qx_numerics.vjp_fwd(x_q, context=None)
+        return x_q
 
     def __sub__(self, other):
         return self.sub(other, jnp.subtract, Operation.SUB, rsub=False)
@@ -432,12 +501,9 @@ class QuaxTensor:
         else:
             raise TypeError(f"Unsupported type for operation: {type(other)}")
 
-        #unquantized output
-        #default - quantize based on the input tensor?
-        qx = quantize(new_x,qx=self)
-        #this is the hard part for me
-        #need to store 
-        store_activation(enrolled_model(), op_name, qx)
+
+        qx = quantize(new_x, enrolled_model(),op_name,is_activation=True, qx=self)
+
         quaxpr_default(qx, op_type, enrolled_model(), op_name = op_name)
         return qx
 
@@ -465,11 +531,7 @@ class QuaxTensor:
         else:
             raise TypeError(f"Unsupported type for operation: {type(other)}")
 
-        #unquantized output
-        qx = quantize(new_x, qx=self)
-        #this is the hard part for me
-        #need to store 
-        store_activation(enrolled_model(), op_name, qx)
+        qx = quantize(new_x, enrolled_model(),op_name,is_activation=True,qx=self)
         quaxpr_default(qx, op_type, enrolled_model(), op_name = op_name)
         return qx
 
@@ -522,7 +584,7 @@ def concatenate(arrays, axis=0, requant=True):
 
     qx = QuaxTensor(x = x, qx = tmp)   
     quaxpr_default(qx, op, mdl, axis=axis, op_name=op_name)
-    store_activation(mdl, op_name, qx)
+    mdl.store_activation(op_name, qx)
 
     return qx
 
@@ -535,13 +597,12 @@ def requantize(qx, scale, zp):
     op_name = f"element-{op_name}"
     quaxpr_default(qx, op_type, enrolled_model(), op_name = op_name)
 
-    qx = quantize(qx.x, calibration_axes=[x for x in range(0, qx.ndim)],
+    mdl = enrolled_model()
+    qx = quantize(qx.x,mdl, op_name, is_activation=True, calibration_axes=[x for x in range(0, qx.ndim)],
                   bits = qx.bits,
                   calibrator = quantizer.PassthroughCalibrator(),
                   po2_scaling = qx.po2_scale, scale = scale, zero_point = zp)
 
-    mdl = enrolled_model()
-    store_activation(mdl, op_name, qx)
     quaxpr_default(qx, op_type, mdl, op_name = op_name)
     return qx
 
@@ -624,19 +685,15 @@ class Activation(nn.Module):
         #TODO - inheriting scale
         if self.scale:
             assert self.zp is not None, "must set zp if setting scale"
-            qx = quantize(x, calibration_axes=[x for x in range(0, x.ndim)],
-                          bits = self.bits,
-                          calibrator = quantizer.PassthroughCalibrator(),
-                          po2_scaling = False, scale = self.scale, zero_point = self.zp)
+            calibrator = quantizer.PassthroughCalibrator()
         else:
-            qx = quantize(x, calibration_axes=[x for x in range(0, x.ndim)],
-                          bits = self.bits,
-                          calibrator = quantizer.AbsMaxCalibrator(),
-                          po2_scaling = False, scale = self.scale, zero_point = self.zp)
+            calibrator = quantizer.AbsMaxCalibrator()
 
 
-
-        store_activation(self, 'output', qx)
+        qx = quantize(x, self, 'output', is_activation=True, calibration_axes=[x for x in range(0, x.ndim)],
+                      bits = self.bits,
+                      calibrator = calibrator,
+                      po2_scaling = False, scale = self.scale, zero_point = self.zp)
         quaxpr_default(qx, self.op_type,self, act_type = self.act_type)
         return qx
 
@@ -647,7 +704,7 @@ def map_appended_activation(act_fn):
     act_map[None] = None
     return act_map[act_fn]
 
-class GRUCell(nn.Module):
+class GRUCell(QModule):
     lhs_bits: int
     rhs_bits: int
     gate_fn = sigmoid
@@ -697,7 +754,7 @@ class GRUCell(nn.Module):
 
         return new_h, new_h
 
-class QDense(nn.Module):
+class QDense(QModule):
     features: int
     lhs_bits: int
     rhs_bits: int
@@ -712,7 +769,12 @@ class QDense(nn.Module):
     def __call__(self, x):
         #need to wrap operation in the quaxpr
         quaxpr_default(x, self.op_type,self )
-        store_quantized(self, 'input', x)
+        train_quant = self.get_tq()
+        if train_quant:
+            self.store_quantized('input', x)
+        else:
+            stored_qx = self.get_quantized('input')
+            x.replace(scale=stored_qx.scale, zero_point=stored_qx.zero_point)
 
         allowed_acts = [nn.relu, nn.relu6, None]
         assert self.act_fn in allowed_acts, f"can't fuse act fn {self.act_fn}"
@@ -726,24 +788,21 @@ class QDense(nn.Module):
           self.param_dtype,
         )
 
-        kernel = quantize(kernel, calibration_axes=[_ for _ in range(0, kernel.ndim)],
+        kernel = quantize(kernel, self, 'kernel', is_activation=False, calibration_axes=[_ for _ in range(0, kernel.ndim)],
                       bits = self.rhs_bits,
                       calibrator = quantizer.AbsMaxCalibrator(use_zp=False),
                       po2_scaling = False)
 
-
-        store_quantized(self, 'kernel', kernel)
 
         if self.use_bias:
           bias = self.param(
             'bias', self.bias_init, (self.features,), self.param_dtype
           )
           #TODO - bias bits
-          bias = quantize(bias, calibration_axes=[_ for _ in range(0, bias.ndim)],
+          bias = quantize(bias, self, 'bias', is_activation=False, calibration_axes=[_ for _ in range(0, bias.ndim)],
                         bits = 16,
                         calibrator = quantizer.AbsMaxCalibrator(use_zp=False),
                         po2_scaling = False)
-          store_quantized(self, 'bias', bias)
         else:
           bias = None
         #TODO -look at speedups from quantized vectors 
@@ -760,16 +819,15 @@ class QDense(nn.Module):
         if self.act_fn:
             y = self.act_fn(y)
         
-        qy = quantize(y, calibration_axes=[_ for _ in range(0, y.ndim)],
+        qy = quantize(y, self, 'output', is_activation=True, calibration_axes=[_ for _ in range(0, y.ndim)],
                       bits = self.lhs_bits,
                       calibrator = quantizer.AbsMaxCalibrator(),
                       po2_scaling = False)
 
-        store_activation(self, 'output', qy)
         quaxpr_default(qy, self.op_type,self, act_fn = map_appended_activation(self.act_fn))
         return qy
 
-class QConv(nn.Module):
+class QConv(QModule):
   """Convolution Module wrapping ``lax.conv_general_dilated``.
 
   Attributes:
@@ -966,11 +1024,10 @@ class QConv(nn.Module):
 
 
 
-    kernel = quantize(kernel, calibration_axes=[_ for _ in range(0, kernel.ndim-1)],
+    kernel = quantize(kernel, self, 'kernel', is_activation=False,calibration_axes=[_ for _ in range(0, kernel.ndim-1)],
                   bits = self.rhs_bits,
                   calibrator = AbsMaxCalibrator(use_zp =False),
                   po2_scaling = False)
-    store_quantized(self, 'kernel', kernel)
 
     if self.use_bias:
       if self.shared_weights:
@@ -981,17 +1038,23 @@ class QConv(nn.Module):
         bias_shape = conv_output_shape[1:]
 
       bias = self.param('bias', self.bias_init, bias_shape, self.param_dtype)
-      bias = quantize(bias, calibration_axes=[_ for _ in range(0, bias.ndim-1)],
+      bias = quantize(bias,self,'bias',is_activation=False, calibration_axes=[_ for _ in range(0, bias.ndim-1)],
                     bits = 16,
                     calibrator = quantizer.AbsMaxCalibrator(use_zp=False),
                     po2_scaling = False)
 
-      store_quantized(self, 'bias', bias)
     else:
       bias = None
 
+    
+    train_quant = self.get_tq() 
+    if train_quant:
+        self.store_quantized('input', x)
+    else:
+        stored_qx = self.get_quantized('input')
+        x.replace(scale=stored_qx.scale, zero_point=stored_qx.zero_point)
 
-    store_quantized(self, 'input', x)
+
     #inputs, kernel, bias = promote_dtype(inputs, kernel, bias, dtype=self.dtype)
     if self.shared_weights:
       y = lax.conv_general_dilated(
@@ -1026,12 +1089,10 @@ class QConv(nn.Module):
         y = self.act_fn(y)
 
         
-    qy = quantize(y, calibration_axes=[_ for _ in range(0, y.ndim)],
+    qy = quantize(y,self, 'output', is_activation=True, calibration_axes=[_ for _ in range(0, y.ndim)],
                   bits = self.lhs_bits,
                   calibrator = quantizer.AbsMaxCalibrator(),
                   po2_scaling = False)
-
-    store_activation(self, 'output', qy)
 
     quaxpr_default(qy, self.op_type,self, lhs_dilation=input_dilation, rhs_dilation=kernel_dilation,window_strides=strides, padding = self.padding, act_fn = map_appended_activation(self.act_fn))
     return qy

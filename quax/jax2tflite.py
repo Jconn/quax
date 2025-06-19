@@ -458,6 +458,9 @@ class FBB:
             op_name = quaxend.params['quax_pytree']['op_name']
         else:
             op_name = 'input'
+        to_tflite = quaxend.params['quax_pytree']['to_tflite']
+        #TODO - concept of dequant doesn't make sense if not converting to tflite
+
 
         in_qxt = self.get_quaxtensor(quaxbegin, op_name)
         
@@ -469,10 +472,13 @@ class FBB:
         else:
             in_tensor = self.make_empty_tensor(in_qxt, quaxbegin.invars[0]) 
 
+        if not to_tflite:
+            #TODO - concept of dequant doesn't make sense if not converting to tflite
+            self.record_activation(dequant_var, in_tensor)
+            return
 
         out_tensor = add_empty_tensor(self.builder, "activation", dequant_var.aval.shape, self.buffers, quantization_params = None, dtype = np.float32)
         self.record_activation(dequant_var, out_tensor)
-
 
         #also map the invar to this tensor, because quant is special
         #TODO - add quant op
@@ -485,23 +491,28 @@ class FBB:
         else:
             op_name = 'output'
 
+        to_tflite = quaxend.params['quax_pytree']['to_tflite']
+
         out_qxt = self.get_quaxtensor(quaxend, op_name)
         
         in_var = quaxbegin.invars[0]
         quant_var = quaxend.invars[0]
 
-        if str(in_var) in self.tensor_act_map.keys():
-            in_tensor = self.tensor_act_map[str(in_var)]
-        else:
-            in_tensor = add_empty_tensor(self.builder, f"activation_{in_var}", quant_var.aval.shape, self.buffers, quantization_params = None, dtype = np.float32)
-        self.record_activation(in_var, in_tensor)
 
         out_tensor = self.make_empty_tensor(out_qxt, quaxend.invars[0]) 
 
         #also map the invar to this tensor, because quant is special
         #TODO - add quant op
-        op = add_quant_layer(self.builder,input_tensor=in_tensor,output_tensor=out_tensor, all_tensors=self.tensors, all_opcodes=self.opcodes) 
-        self.record_op(op)
+        if not to_tflite:
+            self.record_activation(in_var, out_tensor)
+        else:
+            if str(in_var) in self.tensor_act_map.keys():
+                in_tensor = self.tensor_act_map[str(in_var)]
+            else:
+                in_tensor = add_empty_tensor(self.builder, f"activation_{in_var}", quant_var.aval.shape, self.buffers, quantization_params = None, dtype = np.float32)
+            self.record_activation(in_var, in_tensor)
+            op = add_quant_layer(self.builder,input_tensor=in_tensor,output_tensor=out_tensor, all_tensors=self.tensors, all_opcodes=self.opcodes) 
+            self.record_op(op)
 
     def find_model_io(self, model_jaxpr):
         activation_inputs = []

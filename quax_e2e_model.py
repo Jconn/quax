@@ -42,15 +42,15 @@ from jax.experimental import jax2tf
 import tensorflow as tf
 
 from quax.jax2tflite import FBB
-from quax.quax import QDense, Quantize, QConv, enroll_model, Dequantize, GRUCell
+from quax.quax import QDense, Quantize, QConv, Dequantize, GRUCell
 from quax import quax
+from quax.quax import QModule
 import orbax.checkpoint as ocp
 from pathlib import Path
 
-class CNN(nn.Module):
+class CNN(QModule):
     @nn.compact
     def __call__(self, x, recurrent):
-        enroll_model(self)
         act_bits =8
         weight_bits = 8
         bias = False 
@@ -165,7 +165,7 @@ class TrainState(struct.PyTreeNode):
 
 def create_train_state(rng):
   """Creates initial `TrainState`."""
-  cnn_train = CNN()
+  cnn_train = CNN(train_quant=True)
   batch_size = 128
 
   with jax.check_tracer_leaks():
@@ -177,7 +177,7 @@ def create_train_state(rng):
   def mask_fn(tree):
       return {k: (True if k == "params" else False) for k, v in tree.items()}
   #tx = optax.masked(tx, mask_fn)
-  cnn_eval = CNN()
+  cnn_eval = CNN(train_quant=True)
   return TrainState(
       cnn_train=cnn_train,
       cnn_eval=cnn_eval,
@@ -418,8 +418,6 @@ def test_translate(tflite_model, state, weight_only: bool = True):
   # compute serving loss
   one_hot = jax.nn.one_hot(sample_label, 10)
 
-
-  
   inf, updated_var = state.cnn_train.apply(state.model,sample_image,jnp.ones([1,10]), rngs={'params': jax.random.PRNGKey(0)},mutable=True,)
   mlogits, jax_rnn = inf
   tfl_loss = jnp.mean(optax.softmax_cross_entropy(logits=out_logs, labels=one_hot))
@@ -490,7 +488,7 @@ def main():
       state = checkpointer.restore(ckpt_path, target=abstract)
   else:
       state = train_and_evaluate(
-              num_epochs=1, workdir='/tmp/aqt_mnist_example')
+              num_epochs=3, workdir='/tmp/aqt_mnist_example')
       # Save weights using Orbax after training
 
       checkpointer.save(ckpt_path, state)
@@ -503,6 +501,8 @@ def main():
   with open('mnist_quax.tflite', 'wb') as f:
       f.write(tflite)
 
+  cnn_train = CNN(train_quant=False)
+  state = state.replace(cnn_train=cnn_train)
   test_translate('mnist_quax.tflite', state, weight_only=False)
 
   #(Pdb) serving_model['aqt']['Conv_1']['AqtConvGeneralDilated_0']['qrhs']

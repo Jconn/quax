@@ -44,6 +44,7 @@ import abc
 
 @aqt_utils.flax_slots_kw_only_dataclass
 class Calibrator(abc.ABC):
+    use_zp: bool = None
     @abc.abstractmethod
     def calibrate(self, qx, x):
         pass
@@ -55,7 +56,6 @@ class PassthroughCalibrator(Calibrator):
 
 @aqt_utils.flax_slots_kw_only_dataclass
 class AbsMaxCalibrator(Calibrator):
-    use_zp: bool = None
     def calibrate(self, qx, x):
         if self.use_zp is None:
             default_calibrator = calibrator_from_bits(qx.bits)
