@@ -24,6 +24,8 @@ def run_model_vs_tflite(model, input_data, act_bits, use_quantize):
 
     # Use io.BytesIO to simulate a file in memory
     tflite_model_file = io.BytesIO(tflite_model)
+    with open("tflite_model.tflite", "wb") as f:
+        f.write(tflite_model)
 
     # Set up TFLite interpreter using the RAM file
     interpreter = tf.lite.Interpreter(model_content=tflite_model_file.read())

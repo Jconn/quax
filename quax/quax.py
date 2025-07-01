@@ -659,8 +659,16 @@ def reshape(shape, x):
     return x.reshape(shape)
 
 def sigmoid(x, out_bits):
-    max_val = 2**(out_bits-1)
-    x = Activation(out_bits, nn.sigmoid, ActivationType.SIGMOID, scale = 1/max_val, zp = 0)(x) 
+    #TODO - inheriting zero point is not correct here in case quantization values are different 
+    if out_bits <= 8:
+        max_val = 2**(out_bits)
+        zp = -2**(out_bits-1)
+    else:
+        max_val = 2**(out_bits-1)
+        zp = 0
+
+
+    x = Activation(out_bits, nn.sigmoid, ActivationType.SIGMOID, scale = 1/max_val, zp = zp)(x) 
     return x 
 
 def tanh(x, out_bits):

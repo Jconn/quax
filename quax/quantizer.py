@@ -85,11 +85,6 @@ def default_16bit_calibrator(qx, x):
     return min_max_calibrator(qx, x, use_zp = False)
 
 def min_max_calibrator(qx, x, use_zp = False):
-    #if use_zp:
-    #    zp = jnp.mean(x, axis=qx.calibration_axes, keepdims=True)
-    #    zp = jnp.zeros([1], dtype = x.dtype)
-    #else:
-    #    zp = jnp.zeros([1], dtype = x.dtype)
     max_val = jnp.max(x, axis=qx.calibration_axes, keepdims=True)
     min_val = jnp.min(x, axis=qx.calibration_axes, keepdims=True)
     mid_point = (max_val + min_val)/2
