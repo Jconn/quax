@@ -32,7 +32,7 @@ class AppendedActivation(Enum):
     RELU6 = 1
 
 QUAXPR_NAME = "quaxpr"
-quaxpr_p = core.Primitive(QUAXPR_NAME)
+quaxpr_p = jax.extend.core.Primitive(QUAXPR_NAME)
 def unused(x):
     #return jnp.zeros(x.shape)
     return x
@@ -102,10 +102,6 @@ def _zero_from_primal(p,t):
     else:
         # earlier JAX
         aval = aval.at_least_vspace()
-    #import pdb; pdb.set_trace()
-    #import pdb; pdb.set_trace()
-    #return jax.core.ShapedArray(aval, jax.dtypes.float0)
-    #return aval
     new_t = ad.Zero(aval)
     return aval
     return t 
@@ -124,10 +120,6 @@ from jax.interpreters import mlir
 
 mlir.register_lowering(quaxpr_p, quaxpr_lowering, platform='gpu')
 
-#i guess need jvp rules for every value
-
-#what the hell is this doing....it messes things up badly 
-#ad.defjvp(quaxpr_p, quaxpr_jvp, quaxpr_jvp)
 ad.primitive_jvps[quaxpr_p] = quaxpr_jvp
 
 

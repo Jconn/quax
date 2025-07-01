@@ -3,7 +3,7 @@ import io
 import jax
 import jax.numpy as jnp
 import tensorflow as tf
-from quax.quax import Quantize, QConv, Dequantize, QModule
+from quax.quax import Quantize, QDense, Dequantize, QModule
 from flax import linen as nn
 import numpy as np
 from quax.quax_utils import bits_to_type
@@ -12,30 +12,27 @@ from base import run_model_vs_tflite
 
 @pytest.mark.parametrize("act_bits", [8, 16])
 @pytest.mark.parametrize("weight_bits", [8])
-@pytest.mark.parametrize("features", [8, 16])
-@pytest.mark.parametrize("strides", [(1, 1), (1, 2)])
-@pytest.mark.parametrize("kernel_size", [(1, 3), (3, 3)])
-@pytest.mark.parametrize("input_shape", [(1, 10,10,1), (1,6,6,7), (2,6,6,2)])
+@pytest.mark.parametrize("features", [31, 121])
+@pytest.mark.parametrize("input_shape", [(1, 100), (1,7), (2,2)])
 @pytest.mark.parametrize("use_quantize", [False, True])
+@pytest.mark.parametrize("use_bias", [False, True])
 
-def test_cnn(act_bits, weight_bits, features, strides, kernel_size, input_shape,use_quantize):
+def test_fc(act_bits, weight_bits, features, input_shape,use_quantize, use_bias):
     # Create a small CNN model
-    class CNN(QModule):
+    class FC(QModule):
         use_quantize: bool
         @nn.compact
         def __call__(self, x):
             x = Quantize(bits=act_bits, to_tflite=self.use_quantize)(x)
-            x = QConv(features=features, strides=strides, kernel_size=kernel_size,
-                      lhs_bits=act_bits, rhs_bits=weight_bits, use_bias=True, padding='VALID')(x)
+            x = QDense(features=features,lhs_bits=act_bits, rhs_bits=weight_bits, use_bias=use_bias)(x)
             x = Dequantize(to_tflite=self.use_quantize)(x)
             return x
 
-    cnn_model = CNN(train_quant=True, use_quantize=use_quantize)
+    fc_model = FC(train_quant=True, use_quantize=use_quantize)
 
     # Generate random input data
     #input_data = jnp.ones(input_shape)
     input_data = jax.random.uniform(jax.random.key(0),shape=input_shape)
-    cnn_model = CNN(train_quant=True, use_quantize=use_quantize)
 
-    run_model_vs_tflite(cnn_model, input_data, act_bits, use_quantize)
+    run_model_vs_tflite(fc_model, input_data, act_bits, use_quantize)
 

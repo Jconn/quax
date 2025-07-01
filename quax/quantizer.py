@@ -51,8 +51,13 @@ class Calibrator(abc.ABC):
 
 @aqt_utils.flax_slots_kw_only_dataclass
 class PassthroughCalibrator(Calibrator):
+    scale: int
+    zero_point: int
     def calibrate(self, qx, x):
-        return passthrough(qx, x)
+        #TODO - array shaping should be normalized here
+        self.scale = jnp.array(self.scale, dtype=x.dtype)
+        self.zero_point = jnp.array(self.zero_point, dtype=x.dtype)
+        return self.scale, self.zero_point
 
 @aqt_utils.flax_slots_kw_only_dataclass
 class AbsMaxCalibrator(Calibrator):
@@ -107,8 +112,6 @@ def min_max_calibrator(qx, x, use_zp = False):
     #zp = jnp.array([zp], dtype=scale.dtype)
     return scale, -zp 
 
-def passthrough(qx, x):
-    return qx.scale, qx.zp 
 
 def calibrator_from_bits(bits):
     if bits <= 8:

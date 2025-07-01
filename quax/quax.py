@@ -139,7 +139,7 @@ def zeros(shape, bits):
 
 
 default_kernel_init = initializers.lecun_normal()
-marker_p = core.Primitive("marker")
+marker_p = jax.extend.core.Primitive("marker")
 
 def marker_prim(x, graph_id, op_id):
     return marker_p.bind(unwrapped(x), graph_id = graph_id, op_id=op_id)
@@ -233,7 +233,6 @@ def requantize_op(x, scale):
 
 def quantize(x, mdl, name, is_activation, qx=None, **kwargs):
     train_quant = mdl.get_tq()
-
     assert isinstance(x, jnp.ndarray), "x must be jnp array"
 
     if kwargs.get('calibration_axes') is None:
@@ -660,14 +659,16 @@ def reshape(shape, x):
     return x.reshape(shape)
 
 def sigmoid(x, out_bits):
-    x = Activation(out_bits, nn.sigmoid, ActivationType.SIGMOID, scale = 1/32768., zp = 0)(x) 
+    max_val = 2**(out_bits-1)
+    x = Activation(out_bits, nn.sigmoid, ActivationType.SIGMOID, scale = 1/max_val, zp = 0)(x) 
     return x 
 
 def tanh(x, out_bits):
-    x = Activation(out_bits, nn.tanh, ActivationType.TANH, scale=1/32768., zp = 0)(x) 
+    max_val = 2**(out_bits-1)
+    x = Activation(out_bits, nn.tanh, ActivationType.TANH, scale=1/max_val, zp = 0)(x) 
     return x 
 
-class Activation(nn.Module):
+class Activation(QModule):
     lhs_bits: int
     act_fn: nn.activation
     act_type: ActivationType
@@ -685,15 +686,15 @@ class Activation(nn.Module):
         #TODO - inheriting scale
         if self.scale:
             assert self.zp is not None, "must set zp if setting scale"
-            calibrator = quantizer.PassthroughCalibrator()
+            calibrator = quantizer.PassthroughCalibrator(use_zp = True, scale = self.scale, zero_point = self.zp)
         else:
             calibrator = quantizer.AbsMaxCalibrator()
 
 
         qx = quantize(x, self, 'output', is_activation=True, calibration_axes=[x for x in range(0, x.ndim)],
-                      bits = self.bits,
+                      bits = self.lhs_bits,
                       calibrator = calibrator,
-                      po2_scaling = False, scale = self.scale, zero_point = self.zp)
+                      po2_scaling = False)
         quaxpr_default(qx, self.op_type,self, act_type = self.act_type)
         return qx
 

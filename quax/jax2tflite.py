@@ -603,7 +603,6 @@ class FBB:
 
         activation_operator = act_map[quaxend.params['quax_pytree']['act_type']]
 
-
         op = tflite_utils.add_activation_layer(self.builder, in_tensor, out_tensor, activation_operator, self.tensors, self.opcodes)
         self.record_op(op)
 
