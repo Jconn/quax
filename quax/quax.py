@@ -21,7 +21,7 @@ from quax.quax_utils import bits_to_type
 from aqt.jax.v2.aqt_tensor import QTensor
 from jax.interpreters import ad
 from aqt.jax.v2 import aqt_tensor
-from quax.quantizer import Calibrator, PassthroughCalibrator, AbsMaxCalibrator
+from quax.quantizer import Calibrator, PassthroughCalibrator, MovingAverageAbsMaxCalibrator
 from quax import tflite_numerics
 from functools import partial
 import logging
@@ -103,7 +103,8 @@ class QModule(nn.Module):
             return self.get_variable('quax', name)
         else:
             raise Exception("quax variable not found: " + name)
-
+    def var_exists(self, name):
+        return self.has_variable('quax', name)
 
     def store_quantized(self, name, qxtensor,scale_only=False):
         init_fn = lambda: 0
@@ -198,7 +199,7 @@ class Quantize(QModule):
 
         qx = quantize(x, self, 'output', is_activation=True, calibration_axes=[x for x in range(0, x.ndim)],
                       bits = self.bits,
-                      calibrator = quantizer.AbsMaxCalibrator(),
+                      calibrator = quantizer.MovingAverageAbsMaxCalibrator(),
                       po2_scaling = False)
 
         quaxpr_default(qx, self.op_type,self, to_tflite=self.to_tflite)
@@ -254,12 +255,19 @@ def quantize(x, mdl, name, is_activation, qx=None, **kwargs):
     #TODO - remove calibration_axes from tensor, or maybe crush it when a reshape, etc. occurs
     qx.calibration_axes = kwargs.get('calibration_axes')
 
+    #for quantization - next step is to store tensor history instead of just a few samples 
+    #storing tensor history will ensure that quantization scheme is appropriate
     
-    #don't trace calibration step since it isn't gradient effected
-    if train_quant:
-        qx.calibrate(x)
-    else:
+    #if we don't have the var, assume we are just initialized
+    if mdl.var_exists(name):
         stored_qx = mdl.get_quantized(name)
+        stored_scale,stored_zp = stored_qx.scale, stored_qx.zero_point
+    else:
+        stored_scale,stored_zp = None, None
+
+    if train_quant:
+        qx.calibrate(x, (stored_scale, stored_zp))
+    else:
         qx = qx.replace(scale=stored_qx.scale, zero_point=stored_qx.zero_point)
 
 
@@ -314,8 +322,8 @@ class QuaxTensor:
     scale: jnp.ndarray = None
     zero_point: jnp.ndarray = None
     po2_scaling: bool = False
-    def calibrate(self, x):
-        scale, zp = self.calibrator.calibrate(self, x)
+    def calibrate(self, x, stored_calibration):
+        scale, zp = self.calibrator.calibrate(self, x, stored_calibration)
         self.scale = jax.lax.stop_gradient(scale)
         self.zero_point = jax.lax.stop_gradient(zp)
 
@@ -696,7 +704,7 @@ class Activation(QModule):
             assert self.zp is not None, "must set zp if setting scale"
             calibrator = quantizer.PassthroughCalibrator(use_zp = True, scale = self.scale, zero_point = self.zp)
         else:
-            calibrator = quantizer.AbsMaxCalibrator()
+            calibrator = quantizer.MovingAverageAbsMaxCalibrator()
 
 
         qx = quantize(x, self, 'output', is_activation=True, calibration_axes=[x for x in range(0, x.ndim)],
@@ -830,7 +838,7 @@ class QDense(QModule):
         
         qy = quantize(y, self, 'output', is_activation=True, calibration_axes=[_ for _ in range(0, y.ndim)],
                       bits = self.lhs_bits,
-                      calibrator = quantizer.AbsMaxCalibrator(),
+                      calibrator = quantizer.MovingAverageAbsMaxCalibrator(),
                       po2_scaling = False)
 
         quaxpr_default(qy, self.op_type,self, act_fn = map_appended_activation(self.act_fn))
@@ -1035,7 +1043,7 @@ class QConv(QModule):
 
     kernel = quantize(kernel, self, 'kernel', is_activation=False,calibration_axes=[_ for _ in range(0, kernel.ndim-1)],
                   bits = self.rhs_bits,
-                  calibrator = AbsMaxCalibrator(use_zp =False),
+                  calibrator = quantizer.AbsMaxCalibrator(use_zp =False),
                   po2_scaling = False)
 
     if self.use_bias:
@@ -1100,7 +1108,7 @@ class QConv(QModule):
         
     qy = quantize(y,self, 'output', is_activation=True, calibration_axes=[_ for _ in range(0, y.ndim)],
                   bits = self.lhs_bits,
-                  calibrator = quantizer.AbsMaxCalibrator(),
+                  calibrator = quantizer.MovingAverageAbsMaxCalibrator(),
                   po2_scaling = False)
 
     quaxpr_default(qy, self.op_type,self, lhs_dilation=input_dilation, rhs_dilation=kernel_dilation,window_strides=strides, padding = self.padding, act_fn = map_appended_activation(self.act_fn))

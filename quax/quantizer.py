@@ -46,14 +46,14 @@ import abc
 class Calibrator(abc.ABC):
     use_zp: bool = None
     @abc.abstractmethod
-    def calibrate(self, qx, x):
+    def calibrate(self, qx, x, stored_calibration):
         pass
 
 @aqt_utils.flax_slots_kw_only_dataclass
 class PassthroughCalibrator(Calibrator):
     scale: int
     zero_point: int
-    def calibrate(self, qx, x):
+    def calibrate(self, qx, x, stored_calibration):
         #TODO - array shaping should be normalized here
         self.scale = jnp.array(self.scale, dtype=x.dtype)
         self.zero_point = jnp.array(self.zero_point, dtype=x.dtype)
@@ -61,12 +61,39 @@ class PassthroughCalibrator(Calibrator):
 
 @aqt_utils.flax_slots_kw_only_dataclass
 class AbsMaxCalibrator(Calibrator):
-    def calibrate(self, qx, x):
+    def calibrate(self, qx, x, stored_calibration):
         if self.use_zp is None:
             default_calibrator = calibrator_from_bits(qx.bits)
             return default_calibrator(qx, x)
         else:
             return min_max_calibrator(qx, x, use_zp = self.use_zp)
+
+@aqt_utils.flax_slots_kw_only_dataclass
+class MovingAverageAbsMaxCalibrator(Calibrator):
+    decay: float = 0.05
+    def calibrate(self, qx, x, stored_calibration):
+        stored_scale, stored_zp = stored_calibration
+
+        #TODO - zero point mess
+        if self.use_zp is None:
+            if qx.bits <= 8:
+                self.use_zp = True
+            default_calibrator = calibrator_from_bits(qx.bits)
+            current_cal = default_calibrator(qx, x)
+        else:
+            current_cal = min_max_calibrator(qx, x, use_zp = self.use_zp)
+
+        if stored_scale == None or stored_zp == None:
+            # If no stored calibration, just return the current one
+            return current_cal
+
+        current_scale, current_zp = current_cal
+        scale = (1.0 - self.decay) * stored_scale + (self.decay) * current_scale
+        if self.use_zp == True:
+            zero_point = self.decay * stored_zp + (1 - self.decay) * current_zp
+        else:
+            zero_point = 0.0
+        return scale, zero_point
 
 
 
@@ -103,8 +130,6 @@ def min_max_calibrator(qx, x, use_zp = False):
         zp = zp.astype(jnp.int8)
     else:
         zp = jnp.zeros(scale.shape)
-    #TODO - fix zero point usage
-    #zp = jnp.array([zp], dtype=scale.dtype)
     return scale, -zp 
 
 
