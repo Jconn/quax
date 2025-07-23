@@ -8,6 +8,10 @@ from jax import lax
 import jax.numpy as jnp
 
 
+def round_away_from_zero(x):
+  # works for float -> integer-like rounding
+  return jnp.sign(x) * jnp.floor(jnp.abs(x) + 0.5)
+
 @utils.flax_slots_kw_only_dataclass
 class IntAsymmetric(numerics.AqtNumerics):
   """ASymmetric numerics for sint8, sint4, etc that follows tflite numerics"""
@@ -26,23 +30,16 @@ class IntAsymmetric(numerics.AqtNumerics):
   # T, T, 127.0, 1.0, 0.0  # bucket count is odd;  map onto the center of the last bucket
   # pylint: enable=line-too-long
 
-  def get_edge_of_last_int_bucket(self):
-    ret = 2.0 ** (self.bits - 1)
-    if self.preserve_zero:
-      # Lose one bucket.
-      ret -= 0.5
-    return ret
-
 
   def get_quant_bound(self):
-      return self._get_fwd_clip_bound() - self._get_bwd_clip_bound()
+      return self._get_fwd_clip_bound() #- self._get_bwd_clip_bound()
 
   def _get_fwd_clip_bound(self):
     # If we are not rounding, we just clip to bucket edges.
       return (2.0 ** (self.bits - 1)) - 1
 
   def _get_bwd_clip_bound(self):
-      return -2.0 ** (self.bits - 1) 
+      return -1 * (2.0 ** (self.bits - 1) )
 
   def get_dtype(self):
     return self.dtype
@@ -57,7 +54,8 @@ class IntAsymmetric(numerics.AqtNumerics):
     bwd_clip_bound = self._get_bwd_clip_bound()
     if self.clip:
         x = jnp.clip(x, bwd_clip_bound, fwd_clip_bound)
-    x = lax.round(x, lax.RoundingMethod.TO_NEAREST_EVEN)
+    #x = lax.round(x, lax.RoundingMethod.AWAY_FROM_ZERO)
+    x = round_away_from_zero(x)
 
     # Maybe cast: return dtype is either int or the input dtype
     dtype = self.get_dtype()
