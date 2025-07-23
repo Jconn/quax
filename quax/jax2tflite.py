@@ -99,7 +99,6 @@ class FBB:
         self.handlers[Operation.CONCATENATE] = self.concat_handler
 
     def process_quax_op(self, op, quaxbegin, quaxend):
-        print(f"processing {op} - {quaxbegin.invars} - {quaxend.invars}")
         self.handlers[op](quaxbegin, quaxend)
 
     def convert(self, model, params, **inputs):

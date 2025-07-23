@@ -57,18 +57,23 @@ class CNN(QModule):
         x = Quantize(bits=act_bits)(x)
         #TODO - why does this go unstable at stride (1,1)
         x = QConv(features=8, strides=(1,2), kernel_size=(1,3), lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = True, padding='VALID')(x)
-        x = QConv(features=16, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+        x = x.transpose([0,2,1,3])
         #x = x + x
         x = QConv(features=10, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
         x = x.reshape((x.shape[0], -1))
-        x = QDense(features=400,lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = bias)(x)
+        x = x + x
+        x = QDense(features=40,lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = bias)(x)
+        x2 = QDense(features=40,lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = bias)(x)
+        x,_ = GRUCell(lhs_bits = act_bits, rhs_bits = weight_bits)(x, x2)
+        x = x - x2
+        x,_ = GRUCell(lhs_bits = act_bits, rhs_bits = weight_bits)(x,x2)
+
         x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias)(x)
 
         #x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
         x = Dequantize()(x)
         return x, x 
 
-@functools.partial(jax.jit, static_argnums=(3,))
 def apply_model(model_params, images, labels, apply_fn):
   """Computes gradients, loss and accuracy for a single batch."""
 
@@ -91,7 +96,6 @@ def apply_model(model_params, images, labels, apply_fn):
   return grads, loss, accuracy, updated_var
 
 
-@jax.jit
 def update_model(state, grads, updated_var):
   params = state.model['params']
   param_grad = grads['params']
@@ -507,4 +511,5 @@ def main():
 
   #(Pdb) serving_model['aqt']['Conv_1']['AqtConvGeneralDilated_0']['qrhs']
 if __name__ == '__main__':
-    main()
+    with jax.disable_jit():
+        main()

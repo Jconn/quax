@@ -273,7 +273,8 @@ def quantize(x, mdl, name, is_activation, qx=None, **kwargs):
     else:
         qx = qx.replace(scale=stored_scale, zero_point=stored_zp)
 
-
+    if qx.scale is None or qx.zero_point is None:
+        raise Exception("don't have scale/zp. Likely due to init of eval model") 
     @jax.custom_vjp
     def quant(x):
         x, grad = qx.fake_quant(x)
@@ -791,7 +792,7 @@ class QDense(QModule):
         quaxpr_default(x, self.op_type,self )
         train_quant = self.get_tq()
         if train_quant:
-            self.store_quantized('input', x)
+            self.store_quantized('input', x, scale_only=True)
         else:
             if self.var_exists('input'):
                 stored_qx = self.get_quantized('input')
@@ -1076,7 +1077,7 @@ class QConv(QModule):
     
     train_quant = self.get_tq() 
     if train_quant:
-        self.store_quantized('input', x)
+        self.store_quantized('input', x, scale_only=True)
     else:
         if self.var_exists('input'):
             stored_qx = self.get_quantized('input')

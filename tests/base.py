@@ -10,10 +10,13 @@ from quax.quax_utils import bits_to_type
 from quax.jax2tflite import FBB
 
 
-def run_model_vs_tflite(model, input_data, act_bits, use_quantize):
+def run_model_vs_tflite(model, input_data, act_bits, use_quantize, params=None):
 
-    rng = jax.random.PRNGKey(0)
-    params = model.init(rng, input_data)
+    if params is None:
+        # hack - assume init has happened if params are passed
+        rng = jax.random.PRNGKey(0)
+        params = model.init(rng, input_data)
+
 
     # Apply model
     output = model.apply(params, input_data)

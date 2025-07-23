@@ -51,7 +51,7 @@ class IntAsymmetric(numerics.AqtNumerics):
     """Forward pass."""
     res = (x,)
     input_dtype = x.dtype
-    assert self.bits <= 22, 'Too many bits, float32 has less precision.'
+    #assert self.bits <= 22, 'Too many bits, float32 has less precision.'
 
     fwd_clip_bound = self._get_fwd_clip_bound()
     bwd_clip_bound = self._get_bwd_clip_bound()

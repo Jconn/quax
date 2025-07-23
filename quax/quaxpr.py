@@ -3,6 +3,7 @@ from enum import Enum
 from jax.interpreters import ad
 import jax.numpy as jnp 
 import jax
+import flax
 
 
 class Operation(Enum):
@@ -37,11 +38,27 @@ def unused(x):
     #return jnp.zeros(x.shape)
     return x
 
+def make_static(obj):
+    if isinstance(obj, dict):
+        return flax.core.FrozenDict({k: make_static(v) for k, v in obj.items()})
+    if isinstance(obj, list):
+        return tuple(make_static(v) for v in obj)   # tuple of slices is fine
+    if isinstance(obj, slice):
+        return (obj.start, obj.stop, obj.step)           # slice → tuple[int|None]
+    return obj
+
 def quaxpr_prim(*args, quax_pytree):
-    return quaxpr_p.bind(*args,quax_pytree = quax_pytree)
+    quax_pytree = make_static(quax_pytree)
+    args = tuple(args)
+    try:
+        res =  quaxpr_p.bind(*args,quax_pytree = quax_pytree)
+    except:
+        import pdb; pdb.set_trace()
+    return res
 
 
 def quaxpr_unquant_prim(x, quax_pytree):
+    quax_pytree = make_static(quax_pytree)
     return quaxpr_p.bind(x,unused(x), quax_pytree = quax_pytree)
 
 def quaxpr_functional(x, op):

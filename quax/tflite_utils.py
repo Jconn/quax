@@ -334,17 +334,24 @@ def add_strided_slice_layer(builder, input_tensor, output_tensor, slicing_key, a
     for i, s in enumerate(slicing_key):
         if isinstance(s, slice):
             # Handle `slice(start, stop, stride)`
-            begin.append(0 if s.start is None else s.start)
-            end.append(0 if s.stop is None else s.stop)
-            strides.append(1 if s.step is None else s.step)
-            
-            # Adjust masks for None (default slicing)
-            if s.start is None:
-                begin_mask |= (1 << i)  # Ignore the begin value for this dimension
-            if s.stop is None:
-                end_mask |= (1 << i)    # Ignore the end value for this dimension
+            start = s.start
+            stop = s.stop
+            step = s.step
+        elif isinstance(s, tuple):
+            #case - we converted (start,stop,step) to a tuple
+            start, stop, step = s
         else:
             raise ValueError(f"Unsupported slicing type {type(s)} at dimension {i}")
+
+        begin.append(0 if start is None else start)
+        end.append(0 if stop is None else stop)
+        strides.append(1 if step is None else step)
+        
+        # Adjust masks for None (default slicing)
+        if start is None:
+            begin_mask |= (1 << i)  # Ignore the begin value for this dimension
+        if stop is None:
+            end_mask |= (1 << i)    # Ignore the end value for this dimension
 
     # Create the `begin`, `end`, and `stride` tensors 
     op_inputs = [input_tensor]
