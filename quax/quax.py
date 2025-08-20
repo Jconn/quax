@@ -25,6 +25,7 @@ from quax.quantizer import Calibrator, PassthroughCalibrator, MovingAverageAbsMa
 from quax import tflite_numerics
 from functools import partial
 import logging
+import aqt
 from flax.typing import (
   Any,
   Array,
@@ -41,6 +42,19 @@ from flax.typing import (
 )
 
 import copy
+def get_default_numerics(bits, clip=True, clip_gradient=True):
+
+    #return aqt.jax.v2.numerics.int_numerics.IntSymmetric(
+    #    bits=bits,
+    #    preserve_zero=False,
+    #    preserve_max_val=False,
+    #    clip=clip,
+    #    clip_gradient=clip_gradient,
+    #    round=True,
+    #    noise_fn=None,
+    #)
+    #return tflite_numerics.IntAsymmetric(bits=bits, clip=False, clip_gradient=False)
+    return tflite_numerics.IntAsymmetric(bits=bits, clip=clip, clip_gradient=clip_gradient)
 
 
 import contextlib, contextvars
@@ -115,6 +129,10 @@ class QModule(nn.Module):
         if scale_only:
             qxcopy = copy.deepcopy(qxcopy)
             qxcopy.x = None 
+        #make sure that scale and zero point are arrayed 
+        qxtensor.scale = jnp.array(qxtensor.scale).squeeze()
+        qxtensor.zero_point = jnp.array(qxtensor.zero_point).squeeze()
+
         return self.sow('quax', name, qxcopy,
                   init_fn=init_fn, reduce_fn=reduce_fn)
 
@@ -130,11 +148,11 @@ def quaxtensor_from_scalar(scalar , qx, scalar_name, mdl):
 
 def zeros(shape, bits):
     x = jnp.zeros(shape)
-    scale = 1./(2**bits-1)
-    zero_point = 0.0
+    scale = jnp.array([1./(2**bits-1)]).squeeze()
+    zero_point = jnp.array([0.0]).squeeze()
     quaxt = QuaxTensor(x = x, bits = bits, calibration_axes=[x for x in range(0, len(shape))],
-                       qx_numerics=tflite_numerics.IntAsymmetric(bits=bits, clip=False, clip_gradient=False),
-                       calibrator=quantizer.AbsMaxCalibrator(),
+                       qx_numerics=get_default_numerics(bits=bits, clip=True, clip_gradient=True),
+                       calibrator = quantizer.PassthroughCalibrator(scale=scale, zero_point=zero_point,use_zp=False if bits > 8 else True),
                        scale=scale, zero_point=zero_point,
                        po2_scaling=False)
     return quaxt
@@ -246,7 +264,7 @@ def quantize(x, mdl, name, is_activation, qx=None, **kwargs):
 
     if qx is None:
       if kwargs.get('qx_numerics') is None:
-        default_numerics = tflite_numerics.IntAsymmetric(bits=kwargs.get('bits'),
+        default_numerics = get_default_numerics(bits=kwargs.get('bits'),
                                                               clip=True,
                                                               clip_gradient=True,
                                                               )
@@ -344,8 +362,8 @@ class QuaxTensor:
         #but aqt scaling is symmetric [-127, 127], causes an off by one. Need to look more into it
         x_q, res = self.qx_numerics.vjp_fwd(qx, context=None)
         x_q -= self.zero_point
-        quant_grad = jax.tree_util.Partial(self.qx_numerics.vjp_bwd, res)
         x = self.dequant(x_q)
+        quant_grad = jax.tree_util.Partial(self.qx_numerics.vjp_bwd, res)
         return x, quant_grad
     
     def quant(self, x):
@@ -399,6 +417,7 @@ class QuaxTensor:
 
     def quantized_tensor(self):
         x_q = self.quant(self.x)
+        x_q += self.zero_point
         x_q,_ = self.qx_numerics.vjp_fwd(x_q, context=None)
         return x_q
 
@@ -800,8 +819,8 @@ class QDense(QModule):
                 stored_zp = stored_qx.zero_point
             else:
                 #TODO - how to handle initialize pass with no weights passed
-                stored_scale = 1.0
-                stored_zp = 0.0
+                stored_scale = jnp.array([1.0])
+                stored_zp = jnp.array([0.0])
             x.replace(scale=stored_scale, zero_point=stored_zp)
 
         allowed_acts = [nn.relu, nn.relu6, None]

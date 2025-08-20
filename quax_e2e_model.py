@@ -51,28 +51,57 @@ from pathlib import Path
 class CNN(QModule):
     @nn.compact
     def __call__(self, x, recurrent):
-        act_bits =8
+        act_bits =16
         weight_bits = 8
-        bias = False 
+        bias = True 
         x = Quantize(bits=act_bits)(x)
         #TODO - why does this go unstable at stride (1,1)
-        x = QConv(features=8, strides=(1,2), kernel_size=(1,3), lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = True, padding='VALID')(x)
-        x = x.transpose([0,2,1,3])
-        #x = x + x
-        x = QConv(features=10, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+        #x = QConv(features=4, strides=(1,2), kernel_size=(1,3), lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = True, padding='VALID')(x)
+        ##x = x.transpose([0,2,1,3])
+        ##x = x + x
+        #x = QConv(features=8, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+        #x = x.reshape((x.shape[0], -1))
+        ##x1 = QDense(features=40,lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = bias)(x)
+        ##x2 = x * quax.tanh(x, out_bits=act_bits)
+        ##x,_ = GRUCell(lhs_bits = act_bits, rhs_bits = weight_bits)(x1,x2)
+
+        #x = QDense(features=300,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias)(x)
+        #x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias)(x)
+
+        ##x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
+        #x = Dequantize()(x)
+        #return x, x 
+        x = QConv(features=8, strides=(1,2), kernel_size=(1,3), lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = True, padding='SAME')(x)
+        x = QConv(features=16, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+        #x = QConv(features=32, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+        #x = x[...,:8]
         x = x.reshape((x.shape[0], -1))
-        x = x + x
-        x = QDense(features=40,lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = bias)(x)
-        x2 = QDense(features=40,lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = bias)(x)
-        x,_ = GRUCell(lhs_bits = act_bits, rhs_bits = weight_bits)(x, x2)
-        x = x - x2
-        x,_ = GRUCell(lhs_bits = act_bits, rhs_bits = weight_bits)(x,x2)
-
-        x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias)(x)
-
-        #x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
+        x = QDense(features=400,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
+        x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
+        #x = out_x + rec_x
+        pre_x = x
         x = Dequantize()(x)
-        return x, x 
+        return x, pre_x 
+#current
+#epoch:  1, train_loss: 1.787965178489685058593750000000, train_accuracy: 88.049209594726562500000000000000, test_loss: 0.000000000000000000000000000000, test_accuracy: 0.000000000000000000000000000000
+#epoch:  2, train_loss: 0.365248560905456542968750000000, train_accuracy: 94.808357238769531250000000000000, test_loss: 0.000000000000000000000000000000, test_accuracy: 0.000000000000000000000000000000
+#epoch:  3, train_loss: 0.187788516283035278320312500000, train_accuracy: 96.606239318847656250000000000000, test_loss: 0.000000000000000000000000000000, test_accuracy: 0.000000000000000000000000000000
+#saved orbax ckpt
+#get_datasets started
+#get_datasets DONE
+#INFO: Created TensorFlow Lite XNNPACK delegate for CPU.
+#tflite jax PASS - tfl; 0.20701371133327484, jax - 0.20930227637290955
+#python3 quax_e2e_model.py  303.27s user 10.49s system 220% cpu 2:22.52 total
+
+#past
+#epoch:  1, train_loss: 0.181281909346580505371093750000, train_accuracy: 94.422744750976562500000000000000, test_loss: 0.000000000000000000000000000000, test_accuracy: 0.000000000000000000000000000000
+#epoch:  2, train_loss: 0.046388112008571624755859375000, train_accuracy: 98.559364318847656250000000000000, test_loss: 0.000000000000000000000000000000, test_accuracy: 0.000000000000000000000000000000
+#epoch:  3, train_loss: 0.025830011814832687377929687500, train_accuracy: 99.192039489746093750000000000000, test_loss: 0.000000000000000000000000000000, test_accuracy: 0.000000000000000000000000000000
+#python3 quax_e2e_model.py  213.90s user 8.84s system 1004% cpu 22.168 total
+
+@functools.partial(jax.jit, static_argnums=(3,))
+def apply_model(model_params, images, labels, apply_fn):
+  """Computes gradients, loss and accuracy for a single batch."""
 
 def apply_model(model_params, images, labels, apply_fn):
   """Computes gradients, loss and accuracy for a single batch."""
@@ -511,5 +540,4 @@ def main():
 
   #(Pdb) serving_model['aqt']['Conv_1']['AqtConvGeneralDilated_0']['qrhs']
 if __name__ == '__main__':
-    with jax.disable_jit():
-        main()
+    main()

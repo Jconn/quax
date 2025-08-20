@@ -8,7 +8,7 @@ from flax import linen as nn
 import numpy as np
 from quax.quax_utils import bits_to_type
 from quax.jax2tflite import FBB
-from base import run_model_vs_tflite
+from base import run_model_vs_tflite, save_and_load_model
 
 @pytest.mark.parametrize("act_bits", [8])
 @pytest.mark.parametrize("weight_bits", [8])
@@ -36,7 +36,12 @@ def test_slice(act_bits, weight_bits, features, input_shape,use_quantize, use_bi
 
     # Generate random input data
     #input_data = jnp.ones(input_shape)
-    input_data = jax.random.uniform(jax.random.key(0),shape=input_shape)
+    rng = jax.random.PRNGKey(0)
+    input_data = jax.random.uniform(rng,shape=input_shape)
+
+    params = fc_model.init(rng, input_data)
+    test_data = jax.random.uniform(rng,shape=input_shape)
 
     run_model_vs_tflite(fc_model, input_data, act_bits, use_quantize)
+    save_and_load_model(fc_model, params, test_data)
 

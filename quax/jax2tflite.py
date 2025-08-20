@@ -43,8 +43,17 @@ def quantized_weights(qx):
     return qx.quantized_tensor()
 
 def make_quant_params(builder, qxt):
+    def match_dims(a, b):
+        if a.shape == ():
+            return jnp.reshape(jnp.asarray(a), (1,) * b.ndim)
+        return a
+
     weight_scale = qxt.scale
+    weight_zero_point = qxt.zero_point
     dequantized_weights = qxt.x 
+    weight_zero_point = match_dims(weight_zero_point, dequantized_weights)
+    weight_scale = match_dims(weight_scale, dequantized_weights)
+
     target_shape = weight_scale.shape
     reduce_axes = tuple(i for i, (d1, d2) in enumerate(zip(dequantized_weights.shape, target_shape)) if d1 != d2)
     weight_mins = jnp.min(dequantized_weights, axis=reduce_axes, keepdims=True)
@@ -52,8 +61,6 @@ def make_quant_params(builder, qxt):
 
     #need to find the algorithm that matches the mins to the scales
     #TODO - weight zp is always zero
-    weight_zero_point = qxt.zero_point
-
     weight_qparams = add_quantization_params(builder, weight_mins, weight_maxs, weight_scale, weight_zero_point, quantized_dim = 0)
     return weight_qparams
         

@@ -266,23 +266,29 @@ def add_slice_layer(builder, input_tensor, output_tensor,
     size  = []
 
     for i, s in enumerate(slicing_key):
-        if isinstance(s, slice):
-            # ----- begin -----
-            b = 0 if s.start is None else s.start
+        if isinstance(s, int):
+            begin.append(int(s))
+            size.append(1)
+        else:
+            if isinstance(s, slice):
+                # ----- begin -----
+                start = s.start
+                stop = s.stop
+                step = s.step
+            elif isinstance(s, tuple):
+                start, stop, step = s
+            b = 0 if start is None else start
             begin.append(b)
 
             # ----- size -----
-            if s.stop is None:
+            if stop is None:
                 size.append(-1)        # -1 ⇒ “to the end” in TFLite
             else:
-                size.append(s.stop - b)
+                size.append(stop - b)
             # ----- stride -----
-            if s.step not in (None, 1):
+            if step not in (None, 1):
                 raise ValueError("Slice with step≠1 needs StridedSlice")
-        else:
-            # Single-index → size = 1, begin = idx
-            begin.append(int(s))
-            size.append(1)
+
 
     # Constant tensors for begin / size
     for name, vec in (("slice_begin", begin), ("slice_size", size)):
@@ -301,7 +307,6 @@ def add_slice_layer(builder, input_tensor, output_tensor,
 
     slice_inputs  = create_operator_inputs(builder, op_inputs, all_tensors)
     slice_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
-
     slice_op = add_operator(builder,
                             slice_inputs, slice_outputs,
                             None,  # options

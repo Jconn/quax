@@ -130,6 +130,8 @@ def min_max_calibrator(qx, x, use_zp = False):
         zp = zp.astype(jnp.int8)
     else:
         zp = jnp.zeros(scale.shape)
+    scale = jnp.squeeze(scale)
+    zp = jnp.squeeze(zp)
     return scale, -zp 
 
 
