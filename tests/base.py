@@ -72,7 +72,7 @@ def run_model_vs_tflite(model, input_data, act_bits, use_quantize, params=None):
     else:
         diff = jnp.abs(output - tflite_output)
 
-    if diff.max() > 2.0:
+    if diff.max() > 2:
         raise ValueError(f"Outputs do not match! Max diff: {diff.max()}")
 
 

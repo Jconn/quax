@@ -1,12 +1,16 @@
 import flatbuffers
 import numpy as np
-# Assuming the flatbuffer schema files have been generated and are available in your path
-import quax.tflite as tfl
-from quax.tflite import (Model, SubGraph, Tensor, OperatorCode,
-                                        Buffer, Operator, BuiltinOperator, 
-                                        BuiltinOptions, FullyConnectedOptions,ConcatenationOptions,
-                                        ActivationFunctionType, AddOptions, MulOptions, TensorMap,
-                                        SignatureDef, Metadata, QuantizationParameters, ReshapeOptions, TensorType, Conv2DOptions,ActivationFunctionType, Padding, QuantizeOptions, StridedSliceOptions, SliceOptions, DequantizeOptions)
+# Using the new flatbuffer schema generated with object API
+from quax.schema_py_generated import (
+    Model, ModelT, SubGraph, SubGraphT, Tensor, TensorT, OperatorCode, OperatorCodeT,
+    Buffer, BufferT, Operator, OperatorT, BuiltinOperator, 
+    BuiltinOptions, FullyConnectedOptions, FullyConnectedOptionsT, ConcatenationOptions, ConcatenationOptionsT,
+    ActivationFunctionType, AddOptions, AddOptionsT, MulOptions, MulOptionsT, TensorMap, TensorMapT,
+    SignatureDef, SignatureDefT, Metadata, MetadataT, QuantizationParameters, QuantizationParametersT, 
+    ReshapeOptions, ReshapeOptionsT, TensorType, Conv2DOptions, Conv2DOptionsT, Padding, 
+    QuantizeOptions, QuantizeOptionsT, StridedSliceOptions, StridedSliceOptionsT, 
+    SliceOptions, SliceOptionsT, DequantizeOptions, DequantizeOptionsT
+)
 
 from enum import Enum
 import jax.numpy as jnp
@@ -16,219 +20,190 @@ _TFLITE_FILE_IDENTIFIER = b'TFL3'
 
 def map_appended_activation(appended_activation):
     if appended_activation == None:
-        return ActivationFunctionType.ActivationFunctionType.NONE
+        return ActivationFunctionType.NONE
     act_map= {}
-    act_map[AppendedActivation.RELU] = ActivationFunctionType.ActivationFunctionType.RELU
-    act_map[AppendedActivation.RELU6] = ActivationFunctionType.ActivationFunctionType.TANH
+    act_map[AppendedActivation.RELU] = ActivationFunctionType.RELU
+    act_map[AppendedActivation.RELU6] = ActivationFunctionType.TANH
     return act_map[appended_activation] 
 
 def map_tensor_type(dtype):
     dtype_map = {}
-    dtype_map[np.float32] = TensorType.TensorType.FLOAT32
-    dtype_map[np.int32] = TensorType.TensorType.INT32
-    dtype_map[np.int8] = TensorType.TensorType.INT8
-    dtype_map[np.int16] = TensorType.TensorType.INT16
-    dtype_map[np.int64] = TensorType.TensorType.INT64
+    dtype_map[np.float32] = TensorType.FLOAT32
+    dtype_map[np.int32] = TensorType.INT32
+    dtype_map[np.int8] = TensorType.INT8
+    dtype_map[np.int16] = TensorType.INT16
+    dtype_map[np.int64] = TensorType.INT64
     return dtype_map[dtype]
 
 
 
-def add_empty_tensor(builder, tensor_name, tensor_dims, buffers, quantization_params = None, dtype = np.float32):
-    #TODO - datatype resolution
-    tensor_name = builder.CreateString(tensor_name)
-    Tensor.StartShapeVector(builder, len(tensor_dims))
-    for dim in reversed(tensor_dims):
-        builder.PrependInt32(dim)
-    tensor_shape = builder.EndVector()
+def add_empty_tensor(tensor_name, tensor_dims, buffers, quantization_params=None, dtype=np.float32):
+    # Create TensorT object using the object API
+    tensor_obj = TensorT()
+    tensor_obj.name = tensor_name
+    tensor_obj.shape = list(tensor_dims)
+    tensor_obj.type = map_tensor_type(dtype)
+    tensor_obj.buffer = 0  # 0 buffer is standard notation for empty buffer (e.g. activations)
+    tensor_obj.hasRank = True
     
     if quantization_params is None:
-        quantization_params = add_empty_quant(builder)
-    #create tensor
-    Tensor.Start(builder)
-    Tensor.AddShape(builder, tensor_shape)
-    Tensor.AddType(builder, map_tensor_type(dtype) ) 
-    #the 0 buffer is standard notation for empty buffer (e.g. activations)
-    Tensor.AddBuffer(builder, 0) 
-    Tensor.AddName(builder, tensor_name)
-    Tensor.AddHasRank(builder, True)
-    Tensor.AddQuantization(builder,quantization_params)
-    tensor = Tensor.End(builder)
-    return tensor
-
-def add_quantization_params(builder, mins, maxs, scale, zero_point, quantized_dim):
-    #convert all the vectors
-    def to_vec(x):
-        if x is not None:
-            x= np.array(x)
-            return builder.CreateNumpyVector(np.ravel(x) )
-        return None
-    zero_point = np.array(zero_point, dtype=np.int64)
-    mins = to_vec(mins) 
-    maxs = to_vec(maxs)
-    scale = to_vec(scale) 
-    zero_point = to_vec(zero_point)
-    #builder.CreateByteVector(np.ravel(np.array(zero_point, dtype=np.int16)).tobytes())
-
-    QuantizationParameters.Start(builder)
-    if mins is not None:
-        QuantizationParameters.AddMin(builder, mins)
-    if maxs is not None:
-        QuantizationParameters.AddMax(builder, maxs)
-
-    QuantizationParameters.AddScale(builder, scale)
-    QuantizationParameters.AddZeroPoint(builder, zero_point)
-    QuantizationParameters.AddQuantizedDimension(builder, quantized_dim)
-    QuantizationParameters.AddDetailsType(builder, 0)
-    qparams = QuantizationParameters.End(builder)
-    return qparams
-
-
-
-
-def add_tensor_with_buffer(builder, tensor_name, np_shape, buffer, buffers, dtype = np.float32):
-    #TODO - datatype resolution
-    tensor_name = builder.CreateString(tensor_name)
-
-    Tensor.StartShapeVector(builder, len(np_shape))
-    #TODO - need to sort out if this really needs reversing - jaxpr standards seem to be backwards
-    for dim in reversed(np_shape):
-        builder.PrependInt32(dim)
-    tensor_shape = builder.EndVector()
+        quantization_params = add_empty_quant()
+    tensor_obj.quantization = quantization_params
     
-    #TODO - need to deal with empty buffer
-    #add buffer we use here
+    return tensor_obj
+
+def add_quantization_params(mins, maxs, scale, zero_point, quantized_dim):
+    # Create QuantizationParametersT object using object API
+    qparams_obj = QuantizationParametersT()
+    
+    # Convert vectors to numpy arrays 
+    def to_array(x):
+        if x is not None:
+            return np.array(np.ravel(x))
+        return None
+    
+    zero_point = np.array(zero_point, dtype=np.int64)
+    qparams_obj.min = to_array(mins)
+    qparams_obj.max = to_array(maxs)
+    qparams_obj.scale = to_array(scale)
+    qparams_obj.zeroPoint = to_array(zero_point)
+    qparams_obj.quantizedDimension = quantized_dim
+    qparams_obj.detailsType = 0
+    
+    return qparams_obj
+
+
+
+
+def add_tensor_with_buffer(tensor_name, np_shape, buffer, buffers, dtype=np.float32):
+    # Create TensorT object using the object API
+    tensor_obj = TensorT()
+    tensor_obj.name = tensor_name
+    tensor_obj.shape = list(np_shape)
+    tensor_obj.type = map_tensor_type(dtype)
+    tensor_obj.hasRank = True
+    
+    # Find buffer index in list of BufferT objects
     buffer_idx = buffers.index(buffer)
+    tensor_obj.buffer = buffer_idx
+    
+    # Add empty quantization
+    tensor_obj.quantization = add_empty_quant()
+    
+    return tensor_obj
 
-    #create tensor
-    quant = add_empty_quant(builder)
-    Tensor.Start(builder)
-    Tensor.AddShape(builder, tensor_shape)
-    Tensor.AddType(builder, map_tensor_type(dtype) ) 
-    Tensor.AddHasRank(builder, True)
-    Tensor.AddBuffer(builder, buffer_idx) 
-    Tensor.AddName(builder, tensor_name)
-    Tensor.AddQuantization(builder,quant)
-    tensor = Tensor.End(builder)
-    return tensor
-
-def add_empty_quant(builder):
-    QuantizationParameters.QuantizationParametersStart(builder)
-    quantization = QuantizationParameters.QuantizationParametersEnd(builder)
-    return quantization
+def add_empty_quant():
+    # Create empty QuantizationParametersT object using object API
+    quant_obj = QuantizationParametersT()
+    # Return the object directly - it will be packed when the tensor is packed
+    return quant_obj
 
 #tensor add should have a numpy and string as input
-def add_tensor(builder, tensor_name, np_data, buffers, quantization_params = None, dtype = np.float32):
+def add_tensor(tensor_name, np_data, buffers, quantization_params=None, dtype=np.float32):
     #TODO - datatype resolution
     #TODO - type checking on input buffer and requested type
     np_shape = np_data.shape
-    tensor_name = builder.CreateString(tensor_name)
-
-    Tensor.StartShapeVector(builder, len(np_shape))
-    for dim in reversed(np_shape):
-        builder.PrependInt32(dim)
-    tensor_shape = builder.EndVector()
     
-    #TODO - need to deal with empty buffer
-    #add buffer we use here
-    data_vector = builder.CreateByteVector(np.ravel(np_data).tobytes())
-    Buffer.Start(builder)
-    Buffer.AddData(builder, data_vector)
-    buffer = Buffer.End(builder)
+    # Create buffer using object API
+    buffer = add_buffer(buffers, np_data)
     buffers.append(buffer)
-    buffer_idx = buffers.index(buffer)
+    buffer_idx = len(buffers) - 1
 
-    #create tensor
+    # Create TensorT object using the object API
+    tensor_obj = TensorT()
+    tensor_obj.name = tensor_name
+    tensor_obj.shape = list(np_shape)
+    tensor_obj.type = map_tensor_type(dtype)
+    tensor_obj.buffer = buffer_idx
+    tensor_obj.hasRank = True
+    
     if quantization_params is None:
-        quantization_params = add_empty_quant(builder)
+        quantization_params = add_empty_quant()
+    tensor_obj.quantization = quantization_params
+    
+    return tensor_obj
 
-    Tensor.Start(builder)
-    Tensor.AddShape(builder, tensor_shape)
-    Tensor.AddType(builder, map_tensor_type(dtype) ) 
-    Tensor.AddBuffer(builder, buffer_idx) 
-    Tensor.AddName(builder, tensor_name)
-    #TODO - tensor rank
-    Tensor.AddHasRank(builder, True)
-    Tensor.AddQuantization(builder,quantization_params)
-    tensor = Tensor.End(builder)
-    return tensor
+def get_empty_buffer():
+    # Create empty BufferT object using object API
+    buffer_obj = BufferT()
+    return buffer_obj
 
-def get_empty_buffer(builder):
-    Buffer.Start(builder)
-    empty_buffer = Buffer.End(builder)
-    return empty_buffer
+def add_string_buffer(buffers, str_data):
+    # Create BufferT object using object API
+    buffer_obj = BufferT()
+    # For string data, we need to convert to bytes
+    buffer_obj.data = str_data.encode('utf-8')
+    
+    buffers.append(buffer_obj)
+    return buffer_obj
 
-def add_string_buffer(builder, buffers, str_data):
-    str_data = builder.CreateString(str_data)
-    Buffer.Start(builder)
-    Buffer.AddData(builder, str_data)
-    buffer = Buffer.End(builder)
-    buffers.append(buffer)
-    return buffer
-
-def add_buffer(builder, buffers, data = None):
-    #need to create everything being used in the buffer construction
+def add_buffer(buffers, data=None):
+    # Create BufferT object using object API
+    buffer_obj = BufferT()
     if data is not None:
-        data_vector = builder.CreateByteVector(np.ravel(data).tobytes())
-    Buffer.Start(builder)
-    if data is not None:
-        Buffer.AddData(builder, data_vector)
-    buffer = Buffer.End(builder)
-    buffers.append(buffer)
-    return buffer
+        buffer_obj.data = np.ravel(data).tobytes()
+    
+    return buffer_obj
 
-def add_operator(builder, inputs, outputs, options,options_type, opcode, all_opcodes):
+def add_operator(inputs, outputs, options, options_type, opcode, all_opcodes):
     if opcode not in all_opcodes:
         all_opcodes.append(opcode)
 
-    Operator.Start(builder)
-    Operator.AddOpcodeIndex(builder, all_opcodes.index(opcode))
-    Operator.AddInputs(builder, inputs)
-    Operator.AddOutputs(builder, outputs)
+    # Create OperatorT object using object API
+    op_obj = OperatorT()
+    op_obj.opcodeIndex = all_opcodes.index(opcode)
+    op_obj.inputs = inputs
+    op_obj.outputs = outputs
     if options:
-        Operator.AddBuiltinOptions(builder, options)
+        op_obj.builtinOptions = options
     if options_type:
-        Operator.AddBuiltinOptionsType(builder, options_type)
-    op = Operator.End(builder)
-    return op
+        op_obj.builtinOptionsType = options_type
+    
+    return op_obj
 
-def add_vec_layer(builder, input_tensor1, input_tensor2, output_tensor,vec_op, all_tensors, all_opcodes):
+def add_vec_layer(input_tensor1, input_tensor2, output_tensor, vec_op, all_tensors, all_opcodes):
     options = None 
     vec_options = None
-    OperatorCode.Start(builder)
-    OperatorCode.AddBuiltinCode(builder, vec_op)
-    OperatorCode.AddDeprecatedBuiltinCode(builder, vec_op)
-    add_opcode = OperatorCode.End(builder)
-    # Create inputs and outputs
-    inputs = create_operator_inputs(builder, [input_tensor1, input_tensor2], all_tensors)
-    outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
+    
+    # Create OperatorCodeT object using object API
+    opcode_obj = OperatorCodeT()
+    opcode_obj.builtinCode = vec_op
+    opcode_obj.deprecatedBuiltinCode = vec_op
+    
+    # Create inputs and outputs as tensor indices
+    inputs = [all_tensors.index(input_tensor1), all_tensors.index(input_tensor2)]
+    outputs = [all_tensors.index(output_tensor)]
 
-    add_op = add_operator(builder, inputs, outputs, options, vec_options, add_opcode, all_opcodes)
+    add_op = add_operator(inputs, outputs, options, vec_options, opcode_obj, all_opcodes)
     return add_op
 
-def add_concat_layer(builder, input_tensors, output_tensor, axis,all_tensors, all_opcodes):
-
-    ConcatenationOptions.Start(builder) 
-    ConcatenationOptions.AddAxis(builder, axis)
-    concat_options = ConcatenationOptions.End(builder) 
-    OperatorCode.Start(builder)
-    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().CONCATENATION)
-    concat_opcode = OperatorCode.End(builder)
-    concat_inputs = create_operator_inputs(builder, input_tensors, all_tensors)
-    concat_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
-    concat_op = add_operator(builder, concat_inputs, concat_outputs, concat_options, BuiltinOptions.BuiltinOptions().ConcatenationOptions, concat_opcode, all_opcodes)
+def add_concat_layer(input_tensors, output_tensor, axis, all_tensors, all_opcodes):
+    # Create ConcatenationOptionsT object using object API
+    concat_options_obj = ConcatenationOptionsT()
+    concat_options_obj.axis = axis
+    
+    # Create OperatorCodeT object using object API
+    opcode_obj = OperatorCodeT()
+    opcode_obj.builtinCode = BuiltinOperator.CONCATENATION
+    
+    concat_inputs = [all_tensors.index(t) for t in input_tensors]
+    concat_outputs = [all_tensors.index(output_tensor)]
+    concat_op = add_operator(concat_inputs, concat_outputs, concat_options_obj, BuiltinOptions.ConcatenationOptions, opcode_obj, all_opcodes)
     return concat_op
 
-def add_mul_layer(builder, input_tensor1, input_tensor2, output_tensor, all_tensors, all_opcodes):
-    MulOptions.Start(builder)
-    mul_options = MulOptions.End(builder)
-    OperatorCode.Start(builder)
-    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().MUL)
-    mul_opcode = OperatorCode.End(builder)
+def add_mul_layer(input_tensor1, input_tensor2, output_tensor, all_tensors, all_opcodes):
+    # Create MulOptionsT object using object API
+    mul_options_obj = MulOptionsT()
+    
+    # Create OperatorCodeT object using object API
+    opcode_obj = OperatorCodeT()
+    opcode_obj.builtinCode = BuiltinOperator.MUL
+    
     # Create inputs and outputs
-    mul_inputs = create_operator_inputs(builder, [input_tensor1, input_tensor2], all_tensors)
-    mul_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
+    mul_inputs = [all_tensors.index(input_tensor1), all_tensors.index(input_tensor2)]
+    mul_outputs = [all_tensors.index(output_tensor)]
 
-    mul_op = add_operator(builder, mul_inputs, mul_outputs, mul_options, BuiltinOptions.BuiltinOptions().MulOptions, mul_opcode, all_opcodes)
+    mul_op = add_operator(mul_inputs, mul_outputs, mul_options_obj, BuiltinOptions.MulOptions, opcode_obj, all_opcodes)
     return mul_op
 
 def add_relu_layer(builder, input_tensor, output_tensor, all_tensors, all_opcodes):
@@ -247,7 +222,7 @@ def add_relu_layer(builder, input_tensor, output_tensor, all_tensors, all_opcode
     return relu_op
 
 
-def add_slice_layer(builder, input_tensor, output_tensor,
+def add_slice_layer(input_tensor, output_tensor,
                     slicing_key, all_tensors, all_opcodes, all_buffers):
     """
     Adds a Slice operator (begin / size, stride == 1) to the FlatBuffer model.
@@ -293,33 +268,30 @@ def add_slice_layer(builder, input_tensor, output_tensor,
     # Constant tensors for begin / size
     for name, vec in (("slice_begin", begin), ("slice_size", size)):
         t_idx = add_tensor(
-            builder, name,
+            name,
             np.asarray(vec, dtype=np.int32),
             all_buffers, dtype=np.int32)
         all_tensors.append(t_idx)
 
     op_inputs = [input_tensor, all_tensors[-2], all_tensors[-1]]
 
-    # Slice has NO builtin options object
-    OperatorCode.Start(builder)
-    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().SLICE)
-    slice_opcode = OperatorCode.End(builder)
+    slice_opcode = OperatorCodeT()
+    slice_opcode.builtinCode = BuiltinOperator.SLICE
 
-    slice_inputs  = create_operator_inputs(builder, op_inputs, all_tensors)
-    slice_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
-    slice_op = add_operator(builder,
-                            slice_inputs, slice_outputs,
+
+    slice_inputs  = [all_tensors.index(tensor) for tensor in op_inputs] 
+    slice_outputs = [all_tensors.index(output_tensor)] 
+    slice_op = add_operator(slice_inputs, slice_outputs,
                             None,  # options
                             None,
                             slice_opcode, all_opcodes)
 
     return slice_op
-def add_strided_slice_layer(builder, input_tensor, output_tensor, slicing_key, all_tensors, all_opcodes, all_buffers):
+def add_strided_slice_layer(input_tensor, output_tensor, slicing_key, all_tensors, all_opcodes, all_buffers):
     """
     Adds a StridedSlice operator to the TFLite flatbuffer model.
     
     Args:
-        builder: FlatBufferBuilder for constructing the TFLite model.
         input_tensor: Input tensor index.
         output_tensor: Output tensor index.
         slicing_key: Dictionary specifying 'begin', 'end', and 'stride' for each dimension.
@@ -363,202 +335,149 @@ def add_strided_slice_layer(builder, input_tensor, output_tensor, slicing_key, a
     for idx,stride_elem in enumerate((begin, end, strides)):
         dtype = np.int32
         np_arr = np.array(stride_elem, dtype=dtype)
-        in_tensor = add_tensor(builder, f"stride_{idx}", np_arr, all_buffers, dtype=dtype)
+        in_tensor = add_tensor(f"stride_{idx}", np_arr, all_buffers, dtype=dtype)
         op_inputs.append(in_tensor)
         #TODO - a little messy to do things this way decentralized tensor accumulation
         all_tensors.append(in_tensor)
 
-    # Configure the options
-    StridedSliceOptions.StridedSliceOptionsStart(builder)
-    StridedSliceOptions.StridedSliceOptionsAddBeginMask(builder, 0)  # Customize as needed
-    StridedSliceOptions.StridedSliceOptionsAddEndMask(builder, 0)    # Customize as needed
-    StridedSliceOptions.StridedSliceOptionsAddEllipsisMask(builder, 0)
-    StridedSliceOptions.StridedSliceOptionsAddNewAxisMask(builder, 0)
-    StridedSliceOptions.StridedSliceOptionsAddShrinkAxisMask(builder, 0)
-    strided_slice_options = StridedSliceOptions.StridedSliceOptionsEnd(builder)
+    strided_slice_options = StridedSliceOptionsT()
 
-    # Create the OperatorCode for StridedSlice
-    OperatorCode.Start(builder)
-    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().STRIDED_SLICE)
-    strided_slice_opcode = OperatorCode.End(builder)
+    strided_slice_opcode = OperatorCodeT()
+    strided_slice_opcode.builtinCode = BuiltinOperator.STRIDED_SLICE
 
     # Create inputs and outputs
-    strided_slice_inputs = create_operator_inputs(builder, op_inputs, all_tensors)
-    strided_slice_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
+    strided_slice_inputs = [all_tensors.index(tensor) for tensor in op_inputs]
+    strided_slice_outputs = [all_tensors.index(output_tensor)]
+
 
     # Add the StridedSlice operator
-    strided_slice_op = add_operator(builder, strided_slice_inputs, strided_slice_outputs, 
-                                    strided_slice_options, BuiltinOptions.BuiltinOptions().StridedSliceOptions, 
+    strided_slice_op = add_operator(strided_slice_inputs, strided_slice_outputs, 
+                                    strided_slice_options, BuiltinOptions.StridedSliceOptions, 
                                     strided_slice_opcode, all_opcodes)
 
     return strided_slice_op
 
-def add_transpose_layer(builder, input_tensor, output_tensor, axes_perm, all_buffers, all_tensors, all_opcodes):
-    OperatorCode.Start(builder)
-    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().TRANSPOSE)
-    transpose_opcode = OperatorCode.End(builder)
+def add_transpose_layer(input_tensor, output_tensor, axes_perm, all_buffers, all_tensors, all_opcodes):
+    transpose_opcode = OperatorCodeT()
+    transpose_opcode.builtinCode = BuiltinOperator.TRANSPOSE
     
-    perm_tensor = add_tensor(builder, "perm", np.array(axes_perm,dtype=np.int32), all_buffers, dtype=np.int32)
+    perm_tensor = add_tensor("perm", np.array(axes_perm,dtype=np.int32), all_buffers, dtype=np.int32)
     all_tensors.append(perm_tensor)
     # Create inputs and outputs
-    transpose_inputs = create_operator_inputs(builder, [input_tensor, perm_tensor], all_tensors)
-    transpose_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
+    transpose_inputs = [all_tensors.index(x) for x in [input_tensor, perm_tensor]]
+    transpose_outputs = [all_tensors.index(x) for x in [output_tensor]]
 
-    transpose_op = add_operator(builder, transpose_inputs, transpose_outputs, None, None, transpose_opcode, all_opcodes)
+    transpose_op = add_operator(transpose_inputs, transpose_outputs, None, None, transpose_opcode, all_opcodes)
     return transpose_op
 
-def add_reshape_layer(builder, input_tensor, output_tensor, new_shape, all_tensors, all_opcodes, all_buffers):
+def add_reshape_layer(input_tensor, output_tensor, new_shape, all_tensors, all_opcodes, all_buffers):
     # Create the ReshapeOptions
-    ReshapeOptions.StartNewShapeVector(builder, len(new_shape))
-    for dim in reversed(new_shape):
-        builder.PrependInt32(dim)
-    new_shape_vector = builder.EndVector()
+    reshape_options = ReshapeOptionsT()
+    reshape_options.newShape = list(new_shape)
     op_inputs = [input_tensor]
-    reshape_tensor = add_tensor(builder, f"shape", np.array(new_shape, dtype=np.int32), all_buffers, dtype=np.int32)
+
+    reshape_tensor = add_tensor(f"shape", np.array(new_shape, dtype=np.int32), all_buffers, dtype=np.int32)
     op_inputs.append(reshape_tensor)
     all_tensors.append(reshape_tensor)
+    reshape_inputs = [all_tensors.index(tensor) for tensor in op_inputs]
+    reshape_outputs = [all_tensors.index(output_tensor)] 
+    reshape_opcode = OperatorCodeT()
+    reshape_opcode.builtinCode = BuiltinOperator.RESHAPE
 
-    ReshapeOptions.ReshapeOptionsStart(builder)
-    ReshapeOptions.ReshapeOptionsAddNewShape(builder, new_shape_vector)
-    reshape_options = ReshapeOptions.ReshapeOptionsEnd(builder)
-
-    # Create the OperatorCode for Reshape
-    OperatorCode.Start(builder)
-    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().RESHAPE)
-    reshape_opcode = OperatorCode.End(builder)
-    
-    # Create inputs and outputs
-    reshape_inputs = create_operator_inputs(builder, op_inputs, all_tensors)
-    reshape_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
-
-    reshape_op = add_operator(builder, reshape_inputs, reshape_outputs, None,None, reshape_opcode, all_opcodes)
+    reshape_op = add_operator(reshape_inputs, reshape_outputs, None,None, reshape_opcode, all_opcodes)
     return reshape_op
 
-def add_conv_layer(builder, input_tensor, weight_tensor, bias_tensor, output_tensor,bias_dtype,activation_op, all_tensors, all_opcodes,quax_params):
-    Conv2DOptions.Start(builder)
+def add_conv_layer(input_tensor, weight_tensor, bias_tensor, output_tensor,bias_dtype,activation_op, all_tensors, all_opcodes,quax_params):
 
-    Conv2DOptions.AddStrideH(builder, quax_params['window_strides'][0])
-    Conv2DOptions.AddStrideW(builder, quax_params['window_strides'][1])
+    conv_options = Conv2DOptionsT()
 
-    Conv2DOptions.AddDilationHFactor(builder, quax_params['rhs_dilation'][0])
-    Conv2DOptions.AddDilationWFactor(builder, quax_params['rhs_dilation'][1])
+    conv_options.strideH = quax_params['window_strides'][0]
+    conv_options.strideW = quax_params['window_strides'][1]
 
-    Conv2DOptions.AddFusedActivationFunction(builder,activation_op)
+    conv_options.dilationHFactor = quax_params['rhs_dilation'][0]
+    conv_options.dilationWFactor = quax_params['rhs_dilation'][1]
+
+    conv_options.fusedActivationFunction = activation_op 
+
     if quax_params['padding'] == 'SAME':
-        padding = Padding.Padding.SAME 
+        padding = Padding.SAME 
     else:
-        padding = Padding.Padding.VALID 
-    Conv2DOptions.AddPadding(builder, padding)
-    conv_options = Conv2DOptions.End(builder)
-    OperatorCode.Start(builder)
-    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().CONV_2D)
-    conv_opcode = OperatorCode.End(builder)
+        padding = Padding.VALID 
+    conv_options.padding =  padding
+
+    conv_opcode = OperatorCodeT()
+    conv_opcode.builtinCode = BuiltinOperator.CONV_2D
     
     #TODO - ordering here is fragile but important
 
     if bias_tensor:
-        conv_inputs = create_operator_inputs(builder, [input_tensor, weight_tensor, bias_tensor], all_tensors)
+        input_list = [input_tensor, weight_tensor, bias_tensor]
     else:
-        conv_inputs = create_operator_inputs(builder, [input_tensor, weight_tensor], all_tensors)
+        input_list = [input_tensor, weight_tensor]
+    conv_inputs = [all_tensors.index(tensor) for tensor in input_list]
 
-    conv_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
 
-    Operator.Start(builder)
-    Operator.AddOpcodeIndex(builder, 0)
-    Operator.AddInputs(builder, conv_inputs)
-    Operator.AddOutputs(builder, conv_outputs)
-    Operator.AddBuiltinOptions(builder, conv_options)
-    Operator.AddBuiltinOptionsType(builder, BuiltinOptions.BuiltinOptions().Conv2DOptions)
-    conv_op = Operator.End(builder)
+    conv_outputs = [all_tensors.index(output_tensor)]
 
-    conv_op = add_operator(builder, conv_inputs, conv_outputs, conv_options, BuiltinOptions.BuiltinOptions().Conv2DOptions, conv_opcode, all_opcodes)
+    conv_op = add_operator(conv_inputs, conv_outputs, conv_options, BuiltinOptions.Conv2DOptions, conv_opcode, all_opcodes)
     return conv_op
 
-def add_activation_layer(builder, input_tensor, output_tensor,operator_type, all_tensors, all_opcodes):
-    OperatorCode.Start(builder)
-    OperatorCode.AddBuiltinCode(builder, operator_type)
-    act_opcode = OperatorCode.End(builder)
-    act_inputs = create_operator_inputs(builder, [input_tensor], all_tensors)
-    act_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
-    act_op = add_operator(builder, act_inputs, act_outputs, None, None, act_opcode, all_opcodes)
+def add_activation_layer(input_tensor, output_tensor, operator_type, all_tensors, all_opcodes):
+    # Create OperatorCodeT object using object API
+    opcode_obj = OperatorCodeT()
+    opcode_obj.builtinCode = operator_type
+    
+    act_inputs = [all_tensors.index(input_tensor)]
+    act_outputs = [all_tensors.index(output_tensor)]
+    act_op = add_operator(act_inputs, act_outputs, None, None, opcode_obj, all_opcodes)
     return act_op
 
-def add_dequant_layer(builder, input_tensor, output_tensor, all_tensors, all_opcodes):
-    # Create the FullyConnectedOptions
-    DequantizeOptions.Start(builder)
-    dequant_options = DequantizeOptions.End(builder)
-    # Create the OperatorCode for FullyConnected
-    OperatorCode.Start(builder)
-    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().DEQUANTIZE)
-    quant_opcode = OperatorCode.End(builder)
+def add_dequant_layer(input_tensor, output_tensor, all_tensors, all_opcodes):
+    # Create DequantizeOptionsT object using object API
+    dequant_options_obj = DequantizeOptionsT()
+    
+    # Create OperatorCodeT object using object API
+    opcode_obj = OperatorCodeT()
+    opcode_obj.builtinCode = BuiltinOperator.DEQUANTIZE
     
     #TODO - ordering here is fragile but important
+    dequant_inputs = [all_tensors.index(input_tensor)]
+    dequant_outputs = [all_tensors.index(output_tensor)]
 
-    dequant_inputs = create_operator_inputs(builder, [input_tensor], all_tensors)
-    dequant_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
-
-    #Operator.Start(builder)
-    #Operator.AddOpcodeIndex(builder, 0)
-    #Operator.AddInputs(builder, dequant_inputs)
-    #Operator.AddOutputs(builder, dequant_outputs)
-    #Operator.AddBuiltinOptions(builder, dequant_options)
-    #Operator.AddBuiltinOptionsType(builder, BuiltinOptions.BuiltinOptions().DequantizeOptions)
-
-    dequant_op = add_operator(builder, dequant_inputs, dequant_outputs, dequant_options, BuiltinOptions.BuiltinOptions().DequantizeOptions, quant_opcode, all_opcodes)
+    dequant_op = add_operator(dequant_inputs, dequant_outputs, dequant_options_obj, BuiltinOptions.DequantizeOptions, opcode_obj, all_opcodes)
     return dequant_op
-def add_quant_layer(builder, input_tensor, output_tensor, all_tensors, all_opcodes):
-    # Create the FullyConnectedOptions
-    QuantizeOptions.Start(builder)
-    #TODO - need to deal with fusion here - is here a way to do this?
-    #FullyConnectedOptions.AddFusedActivationFunction(builder, ActivationFunctionType.ActivationFunctionType().RELU)
-    quant_options = QuantizeOptions.End(builder)
-    # Create the OperatorCode for FullyConnected
-    OperatorCode.Start(builder)
-    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().QUANTIZE)
-    quant_opcode = OperatorCode.End(builder)
+def add_quant_layer(input_tensor, output_tensor, all_tensors, all_opcodes):
+    # Create QuantizeOptionsT object using object API
+    quant_options_obj = QuantizeOptionsT()
+    
+    # Create OperatorCodeT object using object API
+    opcode_obj = OperatorCodeT()
+    opcode_obj.builtinCode = BuiltinOperator.QUANTIZE
     
     #TODO - ordering here is fragile but important
+    quant_inputs = [all_tensors.index(input_tensor)]
+    quant_outputs = [all_tensors.index(output_tensor)]
 
-    quant_inputs = create_operator_inputs(builder, [input_tensor], all_tensors)
-    quant_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
-
-    Operator.Start(builder)
-    Operator.AddOpcodeIndex(builder, 0)
-    Operator.AddInputs(builder, quant_inputs)
-    Operator.AddOutputs(builder, quant_outputs)
-    Operator.AddBuiltinOptions(builder, quant_options)
-    Operator.AddBuiltinOptionsType(builder, BuiltinOptions.BuiltinOptions().QuantizeOptions)
-    quant_op = Operator.End(builder)
-
-    quant_op = add_operator(builder, quant_inputs, quant_outputs, quant_options, BuiltinOptions.BuiltinOptions().QuantizeOptions, quant_opcode, all_opcodes)
+    quant_op = add_operator(quant_inputs, quant_outputs, quant_options_obj, BuiltinOptions.QuantizeOptions, opcode_obj, all_opcodes)
     return quant_op
 
-def add_fc_layer(builder, input_tensor, weight_tensor, bias_tensor, output_tensor,bias_dtype,activation_op, all_tensors, all_opcodes):
-    # Create the FullyConnectedOptions
-    FullyConnectedOptions.Start(builder)
-    #TODO - need to deal with fusion here - is here a way to do this?
-    #FullyConnectedOptions.AddFusedActivationFunction(builder, ActivationFunctionType.ActivationFunctionType().RELU)
-    FullyConnectedOptions.AddFusedActivationFunction(builder,activation_op)
-    fc_options = FullyConnectedOptions.End(builder)
-    # Create the OperatorCode for FullyConnected
-    OperatorCode.Start(builder)
-    OperatorCode.AddBuiltinCode(builder, BuiltinOperator.BuiltinOperator().FULLY_CONNECTED)
-    fc_opcode = OperatorCode.End(builder)
+def add_fc_layer(input_tensor, weight_tensor, bias_tensor, output_tensor, bias_dtype, activation_op, all_tensors, all_opcodes):
+    # Create FullyConnectedOptionsT object using object API
+    fc_options_obj = FullyConnectedOptionsT()
+    fc_options_obj.fusedActivationFunction = activation_op
+    
+    # Create OperatorCodeT object using object API
+    opcode_obj = OperatorCodeT()
+    opcode_obj.builtinCode = BuiltinOperator.FULLY_CONNECTED
     
     #TODO - ordering here is fragile but important
+    if bias_tensor:
+        fc_inputs = [all_tensors.index(input_tensor), all_tensors.index(weight_tensor), all_tensors.index(bias_tensor)]
+    else:
+        fc_inputs = [all_tensors.index(input_tensor), all_tensors.index(weight_tensor)]
+    fc_outputs = [all_tensors.index(output_tensor)]
 
-    fc_inputs = create_operator_inputs(builder, [input_tensor, weight_tensor, bias_tensor], all_tensors)
-    fc_outputs = create_operator_outputs(builder, [output_tensor], all_tensors)
-
-    Operator.Start(builder)
-    Operator.AddOpcodeIndex(builder, 0)
-    Operator.AddInputs(builder, fc_inputs)
-    Operator.AddOutputs(builder, fc_outputs)
-    Operator.AddBuiltinOptions(builder, fc_options)
-    Operator.AddBuiltinOptionsType(builder, BuiltinOptions.BuiltinOptions().FullyConnectedOptions)
-    fc_op = Operator.End(builder)
-
-    fc_op = add_operator(builder, fc_inputs, fc_outputs, fc_options, BuiltinOptions.BuiltinOptions().FullyConnectedOptions, fc_opcode, all_opcodes)
+    fc_op = add_operator(fc_inputs, fc_outputs, fc_options_obj, BuiltinOptions.FullyConnectedOptions, opcode_obj, all_opcodes)
     return fc_op
 
 
@@ -569,10 +488,11 @@ def create_signature_def(builder, input_tensors, output_tensors, all_tensors, su
     for idx, tensor in enumerate(input_tensors):
         name = f"input_{idx}"
         name_offset = builder.CreateString(name)
-        TensorMap.TensorMapStart(builder)
-        TensorMap.TensorMapAddName(builder, name_offset)
-        TensorMap.TensorMapAddTensorIndex(builder, all_tensors.index(tensor))
-        input_map = TensorMap.TensorMapEnd(builder)
+        from quax.schema_py_generated import TensorMapStart, TensorMapAddName, TensorMapAddTensorIndex, TensorMapEnd
+        TensorMapStart(builder)
+        TensorMapAddName(builder, name_offset)
+        TensorMapAddTensorIndex(builder, all_tensors.index(tensor))
+        input_map = TensorMapEnd(builder)
         input_maps.append(input_map)
 
     # Create TensorMaps for outputs
@@ -580,31 +500,32 @@ def create_signature_def(builder, input_tensors, output_tensors, all_tensors, su
     for idx, tensor in enumerate(output_tensors):
         name = f"output_{idx}"
         name_offset = builder.CreateString(name)
-        TensorMap.TensorMapStart(builder)
-        TensorMap.TensorMapAddName(builder, name_offset)
-        TensorMap.TensorMapAddTensorIndex(builder, all_tensors.index(tensor))
-        output_map = TensorMap.TensorMapEnd(builder)
+        TensorMapStart(builder)
+        TensorMapAddName(builder, name_offset)
+        TensorMapAddTensorIndex(builder, all_tensors.index(tensor))
+        output_map = TensorMapEnd(builder)
         output_maps.append(output_map)
 
     # Create vectors of input and output TensorMaps
+    from quax.schema_py_generated import SignatureDefStartInputsVector, SignatureDefStartOutputsVector, SignatureDefStart, SignatureDefAddSignatureKey, SignatureDefAddSubgraphIndex, SignatureDefAddInputs, SignatureDefAddOutputs, SignatureDefEnd
 
-    SignatureDef.SignatureDefStartInputsVector(builder, len(input_maps))
+    SignatureDefStartInputsVector(builder, len(input_maps))
     for input_map in reversed(input_maps):
         builder.PrependUOffsetTRelative(input_map)
     inputs_vector = builder.EndVector()
 
-    SignatureDef.SignatureDefStartOutputsVector(builder, len(output_maps))
+    SignatureDefStartOutputsVector(builder, len(output_maps))
     for output_map in reversed(output_maps):
         builder.PrependUOffsetTRelative(output_map)
     outputs_vector = builder.EndVector()
 
     # Create the SignatureDef
-    SignatureDef.SignatureDefStart(builder)
-    SignatureDef.AddSignatureKey(builder, signature_key)
-    SignatureDef.AddSubgraphIndex(builder, subgraph_index)
-    SignatureDef.SignatureDefAddInputs(builder, inputs_vector)
-    SignatureDef.SignatureDefAddOutputs(builder, outputs_vector)
-    signature_def = SignatureDef.SignatureDefEnd(builder)
+    SignatureDefStart(builder)
+    SignatureDefAddSignatureKey(builder, signature_key)
+    SignatureDefAddSubgraphIndex(builder, subgraph_index)
+    SignatureDefAddInputs(builder, inputs_vector)
+    SignatureDefAddOutputs(builder, outputs_vector)
+    signature_def = SignatureDefEnd(builder)
 
     return signature_def
 
@@ -614,34 +535,37 @@ def create_runtime_metadata(builder, buffers):
 
     name = builder.CreateString("min_runtime_version")
     
-    Metadata.Start(builder)
-    Metadata.AddName(builder, name)
-    Metadata.AddBuffer(builder, buffers.index(buffer))
-    metadata = Metadata.End(builder)
+    from quax.schema_py_generated import MetadataStart, MetadataAddName, MetadataAddBuffer, MetadataEnd
+    MetadataStart(builder)
+    MetadataAddName(builder, name)
+    MetadataAddBuffer(builder, buffers.index(buffer))
+    metadata = MetadataEnd(builder)
     return metadata
 
 def create_conversion_metadata(builder, buffers):
     #TODO - what metadata is there
 
-
     name = builder.CreateString("CONVERSION_METADATA")
     buffer = add_buffer(builder, buffers, jnp.array(len(buffers)-1))
     
-    Metadata.Start(builder)
-    Metadata.AddName(builder, name)
-    Metadata.AddBuffer(builder, buffers.index(buffer))
-    metadata = Metadata.End(builder)
+    from quax.schema_py_generated import MetadataStart, MetadataAddName, MetadataAddBuffer, MetadataEnd
+    MetadataStart(builder)
+    MetadataAddName(builder, name)
+    MetadataAddBuffer(builder, buffers.index(buffer))
+    metadata = MetadataEnd(builder)
     return metadata
 
 def create_subgraph_tensors(builder, tensors):
-    SubGraph.StartTensorsVector(builder, len(tensors))
+    from quax.schema_py_generated import SubGraphStartTensorsVector
+    SubGraphStartTensorsVector(builder, len(tensors))
     for tensor in reversed(tensors):
         builder.PrependUOffsetTRelative(tensor)
     subgraph_tensors = builder.EndVector()
     return subgraph_tensors
 
 def create_operator_inputs(builder, input_tensors, all_tensors):
-    Operator.StartInputsVector(builder, len(input_tensors))
+    raise Exception("deprecated")
+    builder.StartVector(4, len(input_tensors), 4)
     for itensor in reversed(input_tensors):
         if itensor not in all_tensors:
             builder.PrependInt32(-1) #if the target tensor doesn't exist, append -1 
@@ -651,7 +575,8 @@ def create_operator_inputs(builder, input_tensors, all_tensors):
     return subgraph_inputs
 
 def create_operator_outputs(builder, output_tensors, all_tensors):
-    Operator.StartOutputsVector(builder, len(output_tensors))
+    raise Exception("deprecated")
+    builder.StartVector(4, len(output_tensors), 4)
     for otensor in reversed(output_tensors):
         builder.PrependInt32(all_tensors.index(otensor))  # input tensor index
     subgraph_outputs = builder.EndVector()
@@ -659,21 +584,24 @@ def create_operator_outputs(builder, output_tensors, all_tensors):
 
 
 def create_subgraph_inputs(builder, input_tensors, all_tensors):
-    SubGraph.StartInputsVector(builder, len(input_tensors))
+    from quax.schema_py_generated import SubGraphStartInputsVector
+    SubGraphStartInputsVector(builder, len(input_tensors))
     for itensor in reversed(input_tensors):
         builder.PrependInt32(all_tensors.index(itensor))  # input tensor index
     subgraph_inputs = builder.EndVector()
     return subgraph_inputs
 
 def create_subgraph_outputs(builder, output_tensors, all_tensors):
-    SubGraph.StartOutputsVector(builder, len(output_tensors))
+    from quax.schema_py_generated import SubGraphStartOutputsVector
+    SubGraphStartOutputsVector(builder, len(output_tensors))
     for otensor in reversed(output_tensors):
         builder.PrependInt32(all_tensors.index(otensor))  # output tensor index
     subgraph_inputs = builder.EndVector()
     return subgraph_inputs
 
 def create_subgraph_ops(builder, ops):
-    SubGraph.StartOperatorsVector(builder, len(ops))
+    from quax.schema_py_generated import SubGraphStartOperatorsVector
+    SubGraphStartOperatorsVector(builder, len(ops))
     for op in reversed(ops):
         builder.PrependUOffsetTRelative(op)
     subgraph_ops = builder.EndVector()
@@ -688,74 +616,129 @@ def create_subgraph(builder, subgraph_tensors, subgraph_inputs, subgraph_outputs
     subgraph_tensors = create_subgraph_tensors(builder, subgraph_tensors)
     subgraph_ops = create_subgraph_ops(builder, subgraph_ops)
 
-    SubGraph.Start(builder)
-    SubGraph.AddName(builder, subgraph_name)
-    SubGraph.AddTensors(builder, subgraph_tensors)
-    SubGraph.AddInputs(builder, subgraph_inputs)
-    SubGraph.AddOutputs(builder, subgraph_outputs)
-    SubGraph.AddOperators(builder, subgraph_ops)
-    subgraph = SubGraph.End(builder)
+    from quax.schema_py_generated import SubGraphStart, SubGraphAddName, SubGraphAddTensors, SubGraphAddInputs, SubGraphAddOutputs, SubGraphAddOperators, SubGraphEnd
+    
+    SubGraphStart(builder)
+    SubGraphAddName(builder, subgraph_name)
+    SubGraphAddTensors(builder, subgraph_tensors)
+    SubGraphAddInputs(builder, subgraph_inputs)
+    SubGraphAddOutputs(builder, subgraph_outputs)
+    SubGraphAddOperators(builder, subgraph_ops)
+    subgraph = SubGraphEnd(builder)
     return subgraph
 
 def create_model_subgraphs(builder, subgraphs):
-    Model.StartSubgraphsVector(builder, len(subgraphs))
+    from quax.schema_py_generated import ModelStartSubgraphsVector
+    ModelStartSubgraphsVector(builder, len(subgraphs))
     for subgraph in reversed(subgraphs):
         builder.PrependUOffsetTRelative(subgraph)
     subgraphs = builder.EndVector()
     return subgraphs
 
 def create_metadatas(builder, metadatas):
-    Model.StartMetadataVector(builder, len(metadatas) )
+    from quax.schema_py_generated import ModelStartMetadataVector
+    ModelStartMetadataVector(builder, len(metadatas) )
     for metadata in reversed(metadatas):
         builder.PrependUOffsetTRelative(metadata)
     metadatas = builder.EndVector()
     return metadatas
 
 def create_signature_defs(builder, signature_defs):
-    Model.StartSignatureDefsVector(builder, len(signature_defs) )
+    from quax.schema_py_generated import ModelStartSignatureDefsVector
+    ModelStartSignatureDefsVector(builder, len(signature_defs) )
     for sig_def in reversed(signature_defs):
         builder.PrependUOffsetTRelative(sig_def)
     sig_defs = builder.EndVector()
     return sig_defs
 
 def create_opcodes(builder, op_codes):
-    Model.StartOperatorCodesVector(builder, len(op_codes))
+    from quax.schema_py_generated import ModelStartOperatorCodesVector
+    ModelStartOperatorCodesVector(builder, len(op_codes))
     for opcode in reversed(op_codes):
         builder.PrependUOffsetTRelative(opcode)
     op_codes = builder.EndVector()
     return op_codes
 
 def create_buffers(builder, buffers):
-    Model.StartBuffersVector(builder, len(buffers))
+    from quax.schema_py_generated import ModelStartBuffersVector
+    ModelStartBuffersVector(builder, len(buffers))
     for buffer in reversed(buffers):
         builder.PrependUOffsetTRelative(buffer)
     buffers = builder.EndVector()
     return buffers
 
 def create_model(builder, subgraphs, op_codes, buffers, signature_defs, metadatas):
-    metadatas = create_metadatas(builder, metadatas)
-    signature_defs = create_signature_defs(builder, signature_defs)
-    subgraphs = create_model_subgraphs(builder, subgraphs)
-    op_codes = create_opcodes(builder, op_codes)
-    buffers = create_buffers(builder, buffers)
-    description = builder.CreateString("Quax Converted.")
-    #description = builder.CreateString("MLIR Converted.")
-
-    Model.Start(builder)
-    Model.AddDescription(builder, description)
-    Model.AddVersion(builder, 3)
-    Model.AddSubgraphs(builder, subgraphs)
-    Model.AddOperatorCodes(builder, op_codes)
-    Model.AddBuffers(builder, buffers)
-    Model.AddSignatureDefs(builder, signature_defs)
-    Model.AddMetadata(builder, metadatas)
-    model = Model.End(builder)
+    # Create ModelT object using object API
+    model_obj = ModelT()
+    model_obj.version = 3
+    model_obj.description = "Quax Converted."
+    
+    # Convert the flatbuffer objects to object API equivalents
+    # For now, we'll use the existing functions to create the vectors
+    # A full refactor would convert these to use lists of T objects
+    metadatas_vector = create_metadatas(builder, metadatas)
+    signature_defs_vector = create_signature_defs(builder, signature_defs)
+    subgraphs_vector = create_model_subgraphs(builder, subgraphs)
+    op_codes_vector = create_opcodes(builder, op_codes)
+    buffers_vector = create_buffers(builder, buffers)
+    
+    # For the object API, we would ideally set these as lists:
+    # model_obj.metadata = metadata_objects  # List[MetadataT]
+    # model_obj.signatureDefs = signature_def_objects  # List[SignatureDefT]
+    # model_obj.subgraphs = subgraph_objects  # List[SubGraphT]
+    # model_obj.operatorCodes = op_code_objects  # List[OperatorCodeT]
+    # model_obj.buffers = buffer_objects  # List[BufferT]
+    
+    # For now, create model using traditional builder approach and pack
+    from quax.schema_py_generated import ModelStart, ModelAddDescription, ModelAddVersion, ModelAddSubgraphs, ModelAddOperatorCodes, ModelAddBuffers, ModelAddSignatureDefs, ModelAddMetadata, ModelEnd
+    
+    # Create string before starting model building
+    description_string = builder.CreateString(model_obj.description)
+    
+    ModelStart(builder)
+    ModelAddDescription(builder, description_string)
+    ModelAddVersion(builder, model_obj.version)
+    ModelAddSubgraphs(builder, subgraphs_vector)
+    ModelAddOperatorCodes(builder, op_codes_vector)
+    ModelAddBuffers(builder, buffers_vector)
+    ModelAddSignatureDefs(builder, signature_defs_vector)
+    ModelAddMetadata(builder, metadatas_vector)
+    model = ModelEnd(builder)
     return model
 
-def export_tflite(builder, model):
+def create_runtime_metadata_obj(version_string: str, buffers: list) -> MetadataT:
+    """Create runtime metadata object"""
+    # Add version buffer
+    buffer_obj = BufferT()
+    buffer_obj.data = version_string.encode('utf-8')
+    buffers.append(buffer_obj)
+    
+    metadata_obj = MetadataT()
+    metadata_obj.name = "min_runtime_version"
+    metadata_obj.buffer = len(buffers) - 1
+    return metadata_obj
+
+def create_conversion_metadata_obj(buffers: list) -> MetadataT:
+    """Create conversion metadata object"""
+    # Add conversion buffer
+    buffer_obj = BufferT()
+    buffer_obj.data = jnp.array(len(buffers)-1).tobytes()
+    buffers.append(buffer_obj)
+    
+    metadata_obj = MetadataT()
+    metadata_obj.name = "CONVERSION_METADATA"
+    metadata_obj.buffer = len(buffers) - 1
+    return metadata_obj
+
+def export_tflite(model_obj: ModelT) -> bytes:
+    """Serialize a ModelT object to TFLite flatbuffer format"""
+    builder = flatbuffers.Builder(1024)
+    
+    # Pack the entire model object tree
+    model = model_obj.Pack(builder)
+    
     builder.Finish(model, file_identifier=_TFLITE_FILE_IDENTIFIER)
-    tflite_model_data = builder.Output()
-    return tflite_model_data
+    return builder.Output()
 
 
 
