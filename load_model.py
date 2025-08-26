@@ -8,16 +8,12 @@ from quax.schema_py_generated import (Model, ModelT, SubGraph, SubGraphT, Tensor
                                         ActivationFunctionType)
 import argparse
 
-#model = flatbuffer_utils.read_model("/home/johnconn/fc_in_128_128_relu.tflite")
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # Paths
     parser.add_argument('model', type=str, default='checkpoints', help='checkpoint directory')
     args = parser.parse_args()
     model = flatbuffer_utils.read_model(args.model)
-    #model = flatbuffer_utils.read_model("/home/johnconn/fc_32_64_f32.tflite")
-    #model = flatbuffer_utils.read_model("/home/johnconn/f32_no_quant.tflite")
     print(f"version: {model.version}")
     print(f"opcodes: {len(model.operatorCodes)}")
     print(f"subgraphs: {len(model.subgraphs)}")
