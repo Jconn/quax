@@ -10,8 +10,7 @@ Quax is a training and deployment framework specifically designed for resource-c
 
 - **Layer-level quantization control** - Precise control over quantization at individual layer granularity
 - **Direct TFLite export** - export to flatbuffer format without intermediate conversions  
-- **TensorFlow-independent** - Pure JAX implementation with no TensorFlow dependencies
-- **Microcontroller-optimized** - Built specifically for deployment on embedded systems
+- **TensorFlow-independent** - Pure Jax/Flax implementation with no TensorFlow dependencies
 
 ## Installation
 
