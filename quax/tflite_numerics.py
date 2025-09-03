@@ -8,8 +8,7 @@ from jax import lax
 import jax.numpy as jnp
 
 
-def round_away_from_zero(x):
-  # works for float -> integer-like rounding
+def tflite_round(x):
   return jnp.sign(x) * jnp.floor(jnp.abs(x) + 0.5)
 
 @utils.flax_slots_kw_only_dataclass
@@ -18,6 +17,7 @@ class IntAsymmetric(numerics.AqtNumerics):
   bits: int
   clip: bool
   clip_gradient: bool
+  is_activation: bool
   dtype: None | Any = None
 
   # pylint: disable=line-too-long
@@ -39,6 +39,9 @@ class IntAsymmetric(numerics.AqtNumerics):
       return (2.0 ** (self.bits - 1)) - 1
 
   def _get_bwd_clip_bound(self):
+      # weights are symmetric around zero in tflite 
+      if not self.is_activation:
+          return -1 * self._get_fwd_clip_bound()
       return -1 * (2.0 ** (self.bits - 1) )
 
   def get_dtype(self):
@@ -54,8 +57,7 @@ class IntAsymmetric(numerics.AqtNumerics):
     bwd_clip_bound = self._get_bwd_clip_bound()
     if self.clip:
         x = jnp.clip(x, bwd_clip_bound, fwd_clip_bound)
-    #x = lax.round(x, lax.RoundingMethod.AWAY_FROM_ZERO)
-    x = round_away_from_zero(x)
+    x = tflite_round(x)
 
     # Maybe cast: return dtype is either int or the input dtype
     dtype = self.get_dtype()

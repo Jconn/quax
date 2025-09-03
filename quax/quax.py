@@ -42,19 +42,8 @@ from flax.typing import (
 )
 
 import copy
-def get_default_numerics(bits, clip=True, clip_gradient=True):
-
-    #return aqt.jax.v2.numerics.int_numerics.IntSymmetric(
-    #    bits=bits,
-    #    preserve_zero=False,
-    #    preserve_max_val=False,
-    #    clip=clip,
-    #    clip_gradient=clip_gradient,
-    #    round=True,
-    #    noise_fn=None,
-    #)
-    #return tflite_numerics.IntAsymmetric(bits=bits, clip=False, clip_gradient=False)
-    return tflite_numerics.IntAsymmetric(bits=bits, clip=clip, clip_gradient=clip_gradient)
+def get_default_numerics(bits, clip, clip_gradient, is_activation):
+    return tflite_numerics.IntAsymmetric(bits=bits, clip=clip, clip_gradient=clip_gradient, is_activation=is_activation)
 
 
 import contextlib, contextvars
@@ -267,6 +256,7 @@ def quantize(x, mdl, name, is_activation, qx=None, **kwargs):
         default_numerics = get_default_numerics(bits=kwargs.get('bits'),
                                                               clip=True,
                                                               clip_gradient=True,
+                                                              is_activation=is_activation
                                                               )
         kwargs['qx_numerics'] = default_numerics
       qx = QuaxTensor(x=x, **kwargs)
@@ -629,7 +619,8 @@ def requantize(qx, quant_details):
     quaxpr_default(qx, op_type, enrolled_model(), op_name = op_name, to_tflite = True)
 
     mdl = enrolled_model()
-    qx = quantize(qx.x,mdl, op_name, is_activation=True, calibration_axes=[x for x in range(0, qx.ndim)],
+    #fine to use zero point here and just inherit from input
+    qx = quantize(qx.x, mdl, op_name, is_activation=True, calibration_axes=[x for x in range(0, qx.ndim)],
                   bits = qx.bits,
                   calibrator = quantizer.PassthroughCalibrator(use_zp = True, scale = scale, zero_point = zp),
                   po2_scaling = qx.po2_scaling, scale = scale, zero_point = zp)

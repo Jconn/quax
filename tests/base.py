@@ -52,6 +52,7 @@ def run_model_vs_tflite(model, input_data, act_bits, use_quantize, params=None):
     interpreter.set_tensor(input_index, input_data)
     interpreter.invoke()
     tflite_output = interpreter.get_tensor(output_index)
+    orig_output = tflite_output
 
     # Dequantize the TFLite output
     if not use_quantize:
