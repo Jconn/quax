@@ -504,7 +504,7 @@ def main():
       print(f"Loading model weights from {args.load_weights} using Orbax")
       ckpt_path = Path(args.load_weights).resolve()
       save_state = create_train_state(jax.random.key(0)) 
-      abstract = jax.tree_map(ocp.utils.to_shape_dtype_struct, save_state)
+      abstract = jax.tree.map(ocp.utils.to_shape_dtype_struct, save_state)
       state = checkpointer.restore(ckpt_path, target=abstract)
   else:
       state = train_and_evaluate(
