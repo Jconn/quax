@@ -26,6 +26,7 @@ from quax import tflite_numerics
 from functools import partial
 import logging
 import aqt
+from quax.tflite_numerics import tflite_round
 from flax.typing import (
   Any,
   Array,
@@ -42,6 +43,69 @@ from flax.typing import (
 )
 
 import copy
+
+
+import math
+
+INT32_MIN = -2**31
+INT32_MAX =  2**31 - 1
+
+def saturate_int32(x: int) -> int:
+    return INT32_MIN if x < INT32_MIN else INT32_MAX if x > INT32_MAX else x
+
+def rounding_divide_by_pot(x: int, exponent: int) -> int:
+    """Signed RoundingDivideByPOT with round-half-away-from-zero (TFLite)."""
+    assert exponent >= 0
+    mask = (1 << exponent) - 1
+    if x >= 0:
+        base = x >> exponent
+        remainder = x & mask
+        threshold = 1 << (exponent - 1) if exponent > 0 else 0
+        # ties (== threshold) go away from zero via LSB of base
+        return base + (1 if (remainder > threshold or
+                             (exponent > 0 and remainder == threshold and (base & 1))) else 0)
+    else:
+        # symmetric for negatives
+        return -rounding_divide_by_pot(-x, exponent)
+
+def quantize_multiplier_smaller_than_one(real_multiplier: float):
+    """Return (q, right_shift) s.t. real_multiplier ~= q / 2^(31+right_shift), q in [0,2^31)."""
+    assert 0.0 < real_multiplier < 1.0
+    shift = 0
+    m = real_multiplier
+    while m < 0.5:
+        m *= 2.0
+        shift += 1
+    q = int(round(m * (1 << 31)))
+    if q == (1 << 31):  # edge case
+        q //= 2
+        shift -= 1
+    return q, shift
+
+def quantize_multiplier_greater_than_one(real_multiplier: float):
+    """Return (q, left_shift) s.t. real_multiplier ~= (q * 2^left_shift) / 2^31."""
+    assert real_multiplier >= 1.0
+    m, e = math.frexp(real_multiplier)  # real = m * 2^e, m in [0.5,1)
+    q = int(round(m * (1 << 31)))
+    if q == (1 << 31):
+        q //= 2
+        e += 1
+    left_shift = e  # may be >= 1
+    return q, left_shift
+
+def multiply_by_quantized_multiplier(x: int, real_multiplier: float) -> int:
+    """Integer requantize: x * real_multiplier, with TFLite fixed-point rounding."""
+    if real_multiplier < 1.0:
+        q, rshift = quantize_multiplier_smaller_than_one(real_multiplier)
+        prod = int(x) * int(q)                  # 64-bit in Python
+        y = rounding_divide_by_pot(prod, 31 + rshift)
+        return saturate_int32(y)
+    else:
+        q, lshift = quantize_multiplier_greater_than_one(real_multiplier)
+        prod = int(x) * int(q)
+        y = rounding_divide_by_pot(prod, 31)    # back to int domain
+        y = saturate_int32(y << lshift)         # multiply by 2^left_shift (no rounding needed)
+        return y
 def get_default_numerics(bits, clip, clip_gradient, is_activation):
     return tflite_numerics.IntAsymmetric(bits=bits, clip=clip, clip_gradient=clip_gradient, is_activation=is_activation)
 
@@ -126,10 +190,13 @@ class QModule(nn.Module):
                   init_fn=init_fn, reduce_fn=reduce_fn)
 
 def quaxtensor_from_scalar(scalar , qx, scalar_name, mdl):
+    #TODO - how to best handle scalar quantization. there isn't a max and min for a scalar
+    #   currently just expressed as putting the scalar at the far end of the quantization range
     scalar_array = jnp.array(scalar)
     new_qx = quantize(scalar_array, mdl, scalar_name, calibration_axes=[x for x in range(0, scalar_array.ndim)],
                   bits = qx.bits,
-                  calibrator = quantizer.PassthroughCalibrator(scale=qx.scale, zero_point=qx.zero_point,),
+                  calibrator = quantizer.MovingAverageAbsMaxCalibrator(),
+                  #calibrator = quantizer.PassthroughCalibrator(scale=qx.scale, zero_point=qx.zero_point,),
                   po2_scaling = qx.po2_scaling, scale = qx.scale, zero_point = qx.zero_point, is_activation=False)
 
     return new_qx
@@ -190,6 +257,7 @@ class Dequantize(QModule):
         quaxpr_default(qx, self.op_type,self )
         #TODO - this approach of jaxpr wrapping is flawed
         x = jnp.add(qx.x, 0)
+        x = qx.x * qx.scale
         quaxpr_unquant_prim(x, quax_pytree)
         return x 
 
@@ -242,7 +310,7 @@ def requantize_op(x, scale, zero_point):
     #quaxt = QuaxTensor(x = x, qx = qx, bits = q.numerics.bits)
     return qxt 
 
-def quantize(x, mdl, name, is_activation, qx=None, **kwargs):
+def quantize(x, mdl, name, is_activation, qx=None,input_scalars=None, **kwargs):
     train_quant = mdl.get_tq()
     assert isinstance(x, jnp.ndarray), "x must be jnp array"
 
@@ -277,25 +345,50 @@ def quantize(x, mdl, name, is_activation, qx=None, **kwargs):
         stored_scale,stored_zp = None,None 
 
     if train_quant:
-        qx.calibrate(x, (stored_scale, stored_zp))
+        if input_scalars != None:
+            cal_x = x * input_scalars
+        else:
+            cal_x = x
+        qx.calibrate(cal_x, (stored_scale, stored_zp))
     else:
         qx = qx.replace(scale=stored_scale, zero_point=stored_zp)
 
     if qx.scale is None or qx.zero_point is None:
         raise Exception("don't have scale/zp. Likely due to init of eval model") 
+
+    x = accumulator_rescale(x, qx.scale, prev_scalars = input_scalars)
+
     @jax.custom_vjp
     def quant(x):
-        x, grad = qx.fake_quant(x)
+        x, grad = qx.real_quant(x, prev_scalars = input_scalars)
         return x 
 
+    #def quant_fwd(x):
+    #    x, grad = qx.real_quant(x, prev_scalars = input_scalars)
+    #    return x, grad 
+
+    #def quant_bwd(res, g):
+    #    quant_grad = res
+    #    grad_output = quant_grad(g)[0]
+    #    return grad_output,
+    #    #return quant_grad(g)[0],
+    
+    def _broadcast_lastdim(comp, ref):
+        # Make comp broadcast along all but last dim (per-channel or scalar)
+        while comp.ndim < ref.ndim:
+            comp = jnp.expand_dims(comp, axis=0)
+        return comp.astype(ref.dtype)
     def quant_fwd(x):
-        x, grad = qx.fake_quant(x)
-        return x, grad 
+        x_q, vjp_in = qx.real_quant(x, prev_scalars=input_scalars)
+        # Compute the exact forward linear scale used right before real_quant:
+        # weights/bias: full_scale = 1/αw
+        # activations : full_scale = (αx αw / αy)
+        return x_q, (vjp_in,)
 
     def quant_bwd(res, g):
-        quant_grad = res
-        return quant_grad(g)[0],
-    
+        vjp_in, = res
+        gx = vjp_in(g)[0]               # STE + clip mask from numerics
+        return (gx,)
 
     quant.defvjp(quant_fwd, quant_bwd)
     x = quant(x)
@@ -316,7 +409,33 @@ def unwrapped(x):
 def inherit_quaxtensor(qx):
     return copy.deepcopy(qx)
 
+@jax.custom_vjp
+def _neutral_rescale(x, full_scale):
+    # forward: identical numerics you already need
+    return x * full_scale
 
+def _neutral_rescale_fwd(x, full_scale):
+    y = x * full_scale
+    # stash a stop-grad copy so we can zeros_like it in bwd
+    return y, (jax.lax.stop_gradient(full_scale),)
+
+def accumulator_rescale(x, scale, prev_scalars = None):
+    scale = jnp.where(scale == 0, jnp.ones_like(scale), scale)
+    #if prev_scalars != None:
+    #    x = prev_scalars 
+    #    x = tflite_round(x)
+    #    scale = prev_scalars/scale
+    #    m, shift = jnp.frexp(scale)
+    #    qvalue = (tflite_round(x * m )) * (2.0**shift)
+    #    qvalue = tflite_round(qvalue)
+    if prev_scalars != None:
+        full_scale = prev_scalars/scale
+        #qvalue = tflite_round(x * full_scale)
+        qvalue = x * full_scale
+    else:
+        #qvalue = tflite_round(x/scale)
+        qvalue = x/scale
+    return qvalue
 #CalibratorFn = Callable[[Any, jnp.ndarray], jnp.ndarray, jnp.ndarray]
 
 @aqt_utils.flax_slots_kw_only_dataclass
@@ -343,34 +462,41 @@ class QuaxTensor:
         self.scale = jax.lax.stop_gradient(scale)
         self.zero_point = jax.lax.stop_gradient(zp)
 
-    def fake_quant(self, orig_x):
-        qx = self.quant(orig_x)
-        #TODO - I suspect the numerics needs to include an extra bit of tolerance when zero point is used
-        #the quantized value here represents the real value with zero point already factored in
+    def real_quant(self, qx, prev_scalars = None):
+        #qx = self.quant(orig_x)
+        #qx = quant(orig_x, self.scale, self.zero_point, prev_scalars)
+        qx = tflite_round(qx)
         qx += self.zero_point
-        #TODO - it seems like tflite scaling is asymmetric [-128, 127] for int8
-        #but aqt scaling is symmetric [-127, 127], causes an off by one. Need to look more into it
         x_q, res = self.qx_numerics.vjp_fwd(qx, context=None)
+        x_q = x_q.astype(bits_to_type(self.bits))
+        #choosing to stay in floating point due to limitations of various kernels
+
+        #x_q = real_value/scale + zero_point
+        x_q = x_q.astype(jnp.float32)
+
+        #qx = x_q - self.zero_point
         x_q -= self.zero_point
-        x = self.dequant(x_q)
+        #dequant(x) = (x -b) * s 
+
         quant_grad = jax.tree_util.Partial(self.qx_numerics.vjp_bwd, res)
-        return x, quant_grad
-    
+        return x_q, quant_grad
+
     def quant(self, x):
         #quant(x) = (x/s + b)
         qvalue = x
         qvalue = qvalue
-        s_inv = jax.lax.reciprocal(self.scale)
-        s_inv = jnp.where(jnp.isinf(s_inv), jnp.ones_like(s_inv), s_inv)
-        qvalue *= s_inv
-        #qvalue += self.zero_point
+        s_protected = jnp.where(self.scale == 0, jnp.ones_like(self.scale), self.scale)
+        #s_inv = jax.lax.reciprocal(self.scale)
+        #s_inv = jnp.where(jnp.isinf(s_inv), jnp.ones_like(s_inv), s_inv)
+        #qvalue *= s_inv
+        qvalue /= s_protected
+        qvalue += self.zero_point
         return qvalue
 
     def dequant(self, qvalue):
-        #dequant(x) = (x -b) * s 
-        #x = qvalue - self.zero_point
-        x = qvalue
-        x *= self.scale
+        #dequant(x) = (x -b) * s
+        #qvalue = x-b
+        x = qvalue * self.scale
         return x
 
     @property 
@@ -403,11 +529,18 @@ class QuaxTensor:
         return quaxtensor_transpose(self, axes)
 
     def unquantized_tensor(self):
-        return self.x
+        #x = x_q - zero_point
+        x_f = self.x * self.scale
+        return x_f 
 
     def quantized_tensor(self):
-        x_q = self.quant(self.x)
-        x_q += self.zero_point
+        #self.x is 
+
+        #x_f = (x_q -b) * s 
+        #x_q = x_f/scale + zero_point
+        #x = x_q - zero_point
+
+        x_q = self.x + self.zero_point
         x_q,_ = self.qx_numerics.vjp_fwd(x_q, context=None)
         return x_q
 
@@ -424,7 +557,7 @@ class QuaxTensor:
         return self.__add__(other)
 
     def __mul__(self, other):
-        return self._apply_op(other, jnp.multiply, Operation.MUL)
+        return self.apply_mul(other, jnp.multiply, Operation.MUL)
 
     def __rmul__(self, other):
         return self.__mul__(other)
@@ -495,43 +628,68 @@ class QuaxTensor:
         enrolled_model().scope.reserve(op_name)
         op_name = f"element-{op_name}"
         has_scalar = False 
-        if rsub:
-            input1 = other
-            input2 = self
-        else:
-            input1 = self
-            input2 = other
 
-        if isinstance(other, QuaxTensor):
-            new_x = op(input1.x, input2.x)
-            quaxpr_multiarg(input1, input2, op=op_type, mdl=enrolled_model(), op_name = op_name, has_scalar = has_scalar)
-
-        elif jnp.isscalar(other):
+        if jnp.isscalar(other):
             has_scalar = True
-            if rsub:
-                new_x = op(input1, input2.x)
-            else:
-                new_x = op(input1.x, input2)
-
             scalar_name = f"{op_name}-scalar"
             other = quaxtensor_from_scalar(other, self, scalar_name, enrolled_model())
-            if rsub:
-                input1 = other
-            else:
-                input2 = other
-            #TODO - do we know if this is a weight or activation?
-            quaxpr_multiarg(input1, input2, op=op_type, mdl=enrolled_model(), op_name = op_name, has_scalar = has_scalar, scalar_idx= 0 if rsub else 1)
+
+        if rsub:
+            input1 = other 
+            input2 = self 
         else:
-            raise TypeError(f"Unsupported type for operation: {type(other)}")
+            input1 = self 
+            input2 = other 
+        
+        #l_input = input1.dequant(input1.x)
+        #r_input =  input2.dequant(input2.x)
+        def quantize_scalar(scalar):
+            m, exp = quantize_multiplier(scalar)
+            rounded_m = tflite_round(m * (1<<16))/ (1<<16)
+            rescalar =  (rounded_m * (2.0**exp) )  
+            return rescalar
+        def int_quant(scalar):
+            return tflite_round(scalar * (1<<30))
+
+        twscale = 2*jnp.max(jnp.array([input1.scale, input2.scale]))
+        lscale = input1.scale / twscale
+        rscale = input2.scale / twscale
+        old_x = op(input1.dequant(input1.x),input2.dequant(input2.x))
+        new_x = op(input1.x * lscale,input2.x*rscale)
+        new_x *= twscale
 
 
+
+        quaxpr_multiarg(input1, input2, op=op_type, mdl=enrolled_model(), op_name = op_name, has_scalar = has_scalar, scalar_idx= 0 if rsub else 1)
         qx = quantize(new_x, enrolled_model(),op_name,is_activation=True, qx=self)
-
         quaxpr_default(qx, op_type, enrolled_model(), op_name = op_name)
         return qx
 
 
 
+
+    def apply_mul(self, other, op, op_type):
+        op_name = enrolled_model().scope.default_name("op") 
+        enrolled_model().scope.reserve(op_name)
+        op_name = f"element-{op_name}"
+        #quaxpr_multiarg(self, other, op_type, enrolled_model(), op_name = op_name)
+        has_scalar = False 
+
+        if jnp.isscalar(other):
+            has_scalar = True
+            scalar_name = f"{op_name}-scalar"
+            other = quaxtensor_from_scalar(other, self, scalar_name, enrolled_model())
+
+        result = op(self.x, other.x)
+        scalar = (self.scale * other.scale)
+        new_x = result
+
+
+
+        quaxpr_multiarg(self, other, op=op_type, mdl=enrolled_model(), op_name = op_name, has_scalar = has_scalar, scalar_idx = 1)
+        qx = quantize(new_x, enrolled_model(),op_name,is_activation=True,qx=self, input_scalars = scalar)
+        quaxpr_default(qx, op_type, enrolled_model(), op_name = op_name)
+        return qx
 
     def _apply_op(self, other, op, op_type):
         op_name = enrolled_model().scope.default_name("op") 
@@ -539,17 +697,18 @@ class QuaxTensor:
         op_name = f"element-{op_name}"
         #quaxpr_multiarg(self, other, op_type, enrolled_model(), op_name = op_name)
         has_scalar = False 
-        if isinstance(other, QuaxTensor):
-            new_x = op(self.x, other.x)
-            quaxpr_multiarg(self, other, op=op_type, mdl=enrolled_model(), op_name = op_name, has_scalar = has_scalar)
-        elif jnp.isscalar(other):
+
+        if jnp.isscalar(other):
             has_scalar = True
-            new_x = op(self.x, other)
             scalar_name = f"{op_name}-scalar"
             other = quaxtensor_from_scalar(other, self, scalar_name, enrolled_model())
-            quaxpr_multiarg(self, other, op=op_type, mdl=enrolled_model(), op_name = op_name, has_scalar = has_scalar)
-        else:
-            raise TypeError(f"Unsupported type for operation: {type(other)}")
+
+        l_input = self.dequant(self.x)
+        r_input = other.dequant(other.x)
+
+        new_x = op(l_input,r_input)
+
+        quaxpr_multiarg(self, other, op=op_type, mdl=enrolled_model(), op_name = op_name, has_scalar = has_scalar, scalar_idx= 1)
 
         qx = quantize(new_x, enrolled_model(),op_name,is_activation=True,qx=self)
         quaxpr_default(qx, op_type, enrolled_model(), op_name = op_name)
@@ -599,9 +758,8 @@ def concatenate(arrays, axis=0, requant=True):
     base_arrs = [x.x for x in arrays]
 
     x = jnp.concatenate(base_arrs, axis=axis)
-
-
-    qx = quantize(x,mdl, op_name, is_activation=True, calibration_axes=[x for x in range(0, x.ndim)],
+    #TODO - quantize is expecting non-ints now due to schema change, should be able to handle cleaner
+    qx = quantize(x*output_scale,mdl, op_name, is_activation=True, calibration_axes=[x for x in range(0, x.ndim)],
                   bits = arrays[0].bits,
                   calibrator = quantizer.PassthroughCalibrator(use_zp = True, scale = output_scale, zero_point = output_zp),
                   po2_scaling = arrays[0].po2_scaling, scale = output_scale, zero_point = output_zp)
@@ -617,10 +775,9 @@ def requantize(qx, quant_details):
     enrolled_model().scope.reserve(op_name)
     op_name = f"element-{op_name}"
     quaxpr_default(qx, op_type, enrolled_model(), op_name = op_name, to_tflite = True)
-
     mdl = enrolled_model()
     #fine to use zero point here and just inherit from input
-    qx = quantize(qx.x, mdl, op_name, is_activation=True, calibration_axes=[x for x in range(0, qx.ndim)],
+    qx = quantize(qx.x*qx.scale, mdl, op_name, is_activation=True, calibration_axes=[x for x in range(0, qx.ndim)],
                   bits = qx.bits,
                   calibrator = quantizer.PassthroughCalibrator(use_zp = True, scale = scale, zero_point = zp),
                   po2_scaling = qx.po2_scaling, scale = scale, zero_point = zp)
@@ -693,9 +850,16 @@ def sigmoid(x, out_bits):
     x = Activation(out_bits, nn.sigmoid, ActivationType.SIGMOID, scale = 1/max_val, zp = zp)(x) 
     return x 
 
+def tanh_sigmoid_expression(x):
+  # tanh(x) = 2*sigmoid(2*x) - 1
+  x = 2* nn.sigmoid(2*x) - 1
+  return x
+
+#TODO - proper handling of 16 bit activations 
 def tanh(x, out_bits):
     max_val = 2**(out_bits-1)
-    x = Activation(out_bits, nn.tanh, ActivationType.TANH, scale=1/max_val, zp = 0)(x) 
+    #x = Activation(out_bits, nn.tanh, ActivationType.TANH, scale=1/max_val, zp = 0)(x) 
+    x = Activation(out_bits, tanh_sigmoid_expression, ActivationType.TANH, scale=1/max_val, zp = 0)(x) 
     return x 
 
 class Activation(QModule):
@@ -711,8 +875,7 @@ class Activation(QModule):
 
 
         quaxpr_default(x, self.op_type,self, act_type = self.act_type )
-        x = self.act_fn(x.x)
-            
+        x = self.act_fn(x.dequant(x.x))
         #TODO - inheriting scale
         if self.scale:
             assert self.zp is not None, "must set zp if setting scale"
@@ -785,6 +948,11 @@ class GRUCell(QModule):
 
         return new_h, new_h
 
+def quantize_multiplier(scale):
+    m, exp = jnp.frexp(scale)
+    return m, exp
+    
+
 class QDense(QModule):
     features: int
     lhs_bits: int
@@ -825,7 +993,6 @@ class QDense(QModule):
           (x.shape[-1], self.features),
           self.param_dtype,
         )
-
         kernel = quantize(kernel, self, 'kernel', is_activation=False, calibration_axes=[_ for _ in range(0, kernel.ndim)],
                       bits = self.rhs_bits,
                       calibrator = quantizer.AbsMaxCalibrator(use_zp=False),
@@ -846,22 +1013,47 @@ class QDense(QModule):
         #TODO -look at speedups from quantized vectors 
         y = lax.dot_general(
           x.x,
-          kernel.x,
+          kernel.x ,
           (((x.ndim - 1,), (0,)), ((), ())),
-          precision=None,
+          preferred_element_type=jnp.float32,
         )
+
         if bias is not None:
             #bias has been quantized and dequantized by this point 
-            y += jnp.reshape(bias.x, (1,) * (x.ndim - 1) + (-1,))
-            #x += jnp.reshape(bias, (1,) * (x.ndim - 1) + (-1,))
-        if self.act_fn:
-            y = self.act_fn(y)
-        
+            #TODO - bias handling
+            float_bias = bias.dequant(bias.x)
+            float_bias *= 1.0/(x.scale * kernel.scale)
+            y += jnp.reshape(float_bias, (1,) * (x.ndim - 1) + (-1,))
+
         qy = quantize(y, self, 'output', is_activation=True, calibration_axes=[_ for _ in range(0, y.ndim)],
                       bits = self.lhs_bits,
                       calibrator = quantizer.MovingAverageAbsMaxCalibrator(),
-                      po2_scaling = False)
+                      po2_scaling = False,
+                      input_scalars = x.scale * kernel.scale)
 
+        #def f64(x):
+        #    return np.array(x, dtype=np.float64)
+        #correct_scalar = x.scale * kernel.scale / qy.scale 
+        #corrected_y = f64(orig_y) * correct_scalar
+        #rounded_y = tflite_round(corrected_y) 
+        ##qy.x = rounded_y
+        #target_x = np.array(x.x[0,:], dtype = np.int64)
+        #target_kernel = np.array(kernel.x[:,12], dtype = np.int64)
+        #dp = np.dot(target_x, target_kernel)
+        #m, exp = quantize_multiplier(correct_scalar)
+        #rounded_m = tflite_round(m * (1<<16))/ (1<<16)
+        #rescalar =  (rounded_m * (2.0**exp) ) / correct_scalar
+        #qy.x *= rescalar
+        #if kernel.shape == (2,32):
+        #    big_qm = np.array(rounded_m, dtype=np.int64) 
+        #    qm = (big_qm + (1 << 15)) >> 16
+        #    total_shift = 15 - exp
+        #    round = 1 << (total_shift -1)
+        #    big_result = dp * qm + round 
+        #    result = big_result >> total_shift
+        #    fl_result = dp * correct_scalar
+        if self.act_fn:
+            qy.x = self.act_fn(qy.x)
         quaxpr_default(qy, self.op_type,self, act_fn = map_appended_activation(self.act_fn))
         return qy
 
@@ -1126,18 +1318,21 @@ class QConv(QModule):
           dimension_numbers=dimension_numbers,
           precision=self.precision,
         )
-
+    
     if self.use_bias:
-        y += bias.x.reshape((1,) * (y.ndim - bias.ndim) + bias.shape)  # type: ignore
+        float_bias = bias.dequant(bias.x)
+        float_bias *= 1.0/(x.scale * kernel.scale)
+        y += jnp.reshape(float_bias, (1,) * (y.ndim - bias.ndim) + bias.shape)  # type: ignore
 
-    if self.act_fn:
-        y = self.act_fn(y)
-
-        
     qy = quantize(y,self, 'output', is_activation=True, calibration_axes=[_ for _ in range(0, y.ndim)],
                   bits = self.lhs_bits,
                   calibrator = quantizer.MovingAverageAbsMaxCalibrator(),
-                  po2_scaling = False)
+                  po2_scaling = False,
+                  input_scalars = x.scale * kernel.scale)
+
+    if self.act_fn:
+        qy.x = self.act_fn(qy.x)
+
 
     quaxpr_default(qy, self.op_type,self, lhs_dilation=input_dilation, rhs_dilation=kernel_dilation,window_strides=strides, padding = self.padding, act_fn = map_appended_activation(self.act_fn))
     return qy

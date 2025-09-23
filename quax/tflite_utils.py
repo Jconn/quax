@@ -142,6 +142,7 @@ def add_buffer(buffers, data=None):
     buffer_obj = BufferT()
     if data is not None:
         buffer_obj.data = np.ravel(data).tobytes()
+        #buffer_obj.size = len(buffer_obj.data) if buffer_obj.data else 0
     
     return buffer_obj
 
@@ -465,7 +466,7 @@ def add_fc_layer(input_tensor, weight_tensor, bias_tensor, output_tensor, bias_d
     # Create FullyConnectedOptionsT object using object API
     fc_options_obj = FullyConnectedOptionsT()
     fc_options_obj.fusedActivationFunction = activation_op
-    fc_options_obj.keepNumDims = True 
+    fc_options_obj.keepNumDims = False 
     fc_options_obj.quantizedBiasType = map_tensor_type(bias_dtype)
     
     # Create OperatorCodeT object using object API

@@ -64,6 +64,7 @@ class CNN(QModule):
         #x = x[...,:8]
         x = x.reshape((x.shape[0], -1))
         x = QDense(features=400,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
+        #x = QDense(features=200,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
         x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
         #x = out_x + rec_x
         pre_x = x
@@ -106,9 +107,13 @@ def apply_model(model_params, images, labels, apply_fn):
     return loss, (logits, updated_var)
   grad_fn = jax.value_and_grad(loss_fn, has_aux=True, allow_int=True)
   aux, grads = grad_fn(model_params)
-  #grads['params']['QDense_0']['kernel']
+  max_grad = grads['params']['QDense_0']['kernel'].max()
+  #vals = [jnp.abs(grads['params'][f'QDense_{i}']['kernel']).mean() for i in range(3)]
+  #print(vals)
   loss, (logits, updated_var) = aux
   accuracy = jnp.mean(jnp.argmax(logits, -1) == labels)
+  if max_grad > 4:
+      print(f"max grad {max_grad}")
   return grads, loss, accuracy, updated_var
 
 
@@ -527,4 +532,5 @@ def main():
 
   #(Pdb) serving_model['aqt']['Conv_1']['AqtConvGeneralDilated_0']['qrhs']
 if __name__ == '__main__':
+    #with jax.disable_jit():
     main()

@@ -15,11 +15,12 @@ from base import run_model_vs_tflite, save_and_load_model
 @pytest.mark.parametrize("features", [8, 16])
 @pytest.mark.parametrize("strides", [(1, 1), (1, 2)])
 @pytest.mark.parametrize("kernel_size", [(1, 3), (3, 3)])
-@pytest.mark.parametrize("input_shape", [(1, 10,10,1), (1,6,6,7), (2,6,6,2)])
+@pytest.mark.parametrize("input_shape", [(1, 10,10,1), (1,300,300,7), (2,6,6,2)])
 @pytest.mark.parametrize("use_quantize", [False, True])
 @pytest.mark.parametrize("use_relu", [False, True])
+@pytest.mark.parametrize("padding", ['VALID', 'SAME'])
 
-def test_cnn(act_bits, weight_bits, features, strides, kernel_size, input_shape,use_quantize, use_relu):
+def test_cnn(act_bits, weight_bits, features, strides, kernel_size, input_shape,use_quantize, use_relu, padding):
     # Create a small CNN model
     class CNN(QModule):
         use_quantize: bool
@@ -28,7 +29,8 @@ def test_cnn(act_bits, weight_bits, features, strides, kernel_size, input_shape,
             x = Quantize(bits=act_bits, to_tflite=self.use_quantize)(x)
             act_fn = nn.relu if use_relu else None 
             x = QConv(features=features, strides=strides, kernel_size=kernel_size,
-                      lhs_bits=act_bits, rhs_bits=weight_bits, use_bias=True, padding='VALID',act_fn=act_fn)(x)
+                      lhs_bits=act_bits, rhs_bits=weight_bits, use_bias=True, padding=padding,act_fn=act_fn)(x)
+
             x = Dequantize(to_tflite=self.use_quantize)(x)
             return x
 

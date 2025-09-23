@@ -11,6 +11,7 @@ import jax.numpy as jnp
 def tflite_round(x):
   return jnp.sign(x) * jnp.floor(jnp.abs(x) + 0.5)
 
+
 @utils.flax_slots_kw_only_dataclass
 class IntAsymmetric(numerics.AqtNumerics):
   """ASymmetric numerics for sint8, sint4, etc that follows tflite numerics"""
@@ -55,9 +56,11 @@ class IntAsymmetric(numerics.AqtNumerics):
 
     fwd_clip_bound = self._get_fwd_clip_bound()
     bwd_clip_bound = self._get_bwd_clip_bound()
+    x = tflite_round(x)
+    x = x.astype(jnp.int32)
     if self.clip:
         x = jnp.clip(x, bwd_clip_bound, fwd_clip_bound)
-    x = tflite_round(x)
+    x = x.astype(jnp.float32)
 
     # Maybe cast: return dtype is either int or the input dtype
     dtype = self.get_dtype()

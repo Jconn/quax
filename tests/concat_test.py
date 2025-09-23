@@ -27,14 +27,15 @@ def test_concat(act_bits, weight_bits, features, input_shape,use_quantize, use_b
         def __call__(self, x):
             x = Quantize(bits=act_bits, to_tflite=self.use_quantize)(x)
             act_fn = nn.relu if use_relu else None 
-            x = QDense(features=features,lhs_bits=act_bits, rhs_bits=weight_bits, use_bias=use_bias,act_fn=act_fn)(x)
-            x2 = QDense(features=features*2,lhs_bits=act_bits, rhs_bits=weight_bits, use_bias=use_bias,act_fn=act_fn)(x)
-            x3 = QDense(features=features*3,lhs_bits=act_bits, rhs_bits=weight_bits, use_bias=use_bias,act_fn=act_fn)(x)
-            x = concatenate([x3,x, x2], axis=-1)
-            x = QDense(features=features,lhs_bits=act_bits, rhs_bits=weight_bits, use_bias=use_bias,act_fn=act_fn)(x)
-            x2 = QDense(features=features,lhs_bits=act_bits, rhs_bits=weight_bits, use_bias=use_bias,act_fn=act_fn)(x)
-            x3 = QDense(features=features,lhs_bits=act_bits, rhs_bits=weight_bits, use_bias=use_bias,act_fn=act_fn)(x)
-            x = stack([x2,x3,x], axis=-1)
+            #x = QDense(features=features,lhs_bits=act_bits, rhs_bits=weight_bits, use_bias=use_bias,act_fn=act_fn)(x)
+            #x2 = QDense(features=features*2,lhs_bits=act_bits, rhs_bits=weight_bits, use_bias=use_bias,act_fn=act_fn)(x)
+            #x3 = QDense(features=features*3,lhs_bits=act_bits, rhs_bits=weight_bits, use_bias=use_bias,act_fn=act_fn)(x)
+            #x = concatenate([x3,x, x2], axis=-1)
+            #x = QDense(features=features,lhs_bits=act_bits, rhs_bits=weight_bits, use_bias=use_bias,act_fn=act_fn)(x)
+            #x2 = QDense(features=features,lhs_bits=act_bits, rhs_bits=weight_bits, use_bias=use_bias,act_fn=act_fn)(x)
+            #x3 = QDense(features=features,lhs_bits=act_bits, rhs_bits=weight_bits, use_bias=use_bias,act_fn=act_fn)(x)
+            #x = stack([x2,x3,x], axis=-1)
+            x = concatenate([x,x], axis=-1)
             x = Dequantize(to_tflite=self.use_quantize)(x)
             return x
 

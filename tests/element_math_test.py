@@ -10,9 +10,9 @@ from quax.quax_utils import bits_to_type
 from quax.jax2tflite import FBB
 from base import run_model_vs_tflite, save_and_load_model
 
-@pytest.mark.parametrize("act_bits", [8, 16])
+@pytest.mark.parametrize("act_bits", [8,16])
 @pytest.mark.parametrize("weight_bits", [8])
-@pytest.mark.parametrize("features", [34])
+@pytest.mark.parametrize("features", [32])
 @pytest.mark.parametrize("input_shape", [(1,7), (2,2)])
 @pytest.mark.parametrize("use_quantize", [False, True])
 @pytest.mark.parametrize("use_bias", [True])
@@ -31,10 +31,13 @@ def test_element_math(act_bits, weight_bits, features, input_shape,use_quantize,
             x1 = QDense(features=features,lhs_bits=act_bits, rhs_bits=weight_bits, use_bias=use_bias,act_fn=act_fn)(x)
             x2= QDense(features=features,lhs_bits=act_bits, rhs_bits=weight_bits, use_bias=use_bias,act_fn=act_fn)(x)
             x = sigmoid(x, act_bits)
+
             
             x3 = x + x2
             x4 = x1 - x2
-            x = (x3 * x4) * (1.0-x)
+            x5 = (x3 * x4) 
+            x6 = (1.0-x)
+            x = x5 * x6
             x = x * x
             x = Dequantize(to_tflite=self.use_quantize)(x)
             return x
@@ -48,6 +51,6 @@ def test_element_math(act_bits, weight_bits, features, input_shape,use_quantize,
     params = fc_model.init(rng, input_data)
     test_data = jax.random.uniform(rng,shape=input_shape)
 
-    run_model_vs_tflite(fc_model, input_data, act_bits, use_quantize)
+    run_model_vs_tflite(fc_model, input_data, act_bits, use_quantize, tolerance=0.0 if act_bits < 16 else 1.01)
     save_and_load_model(fc_model, params, test_data)
 

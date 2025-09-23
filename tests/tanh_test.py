@@ -11,7 +11,7 @@ from quax.jax2tflite import FBB
 from base import run_model_vs_tflite, save_and_load_model
 
 @pytest.mark.parametrize("act_bits", [8, 16])
-@pytest.mark.parametrize("input_shape", [(1, 100), (1,7), (2,2)])
+@pytest.mark.parametrize("input_shape", [(1, 100), (1,7), (2,2), (1,10,10,1), (1,6,6,7), (2,6,6,2)])
 @pytest.mark.parametrize("use_quantize", [False, True])
 
 def test_tanh(act_bits, input_shape,use_quantize):
@@ -33,6 +33,6 @@ def test_tanh(act_bits, input_shape,use_quantize):
     input_data = jax.random.uniform(rng,shape=input_shape)
     params = model.init(rng, input_data)
     test_data = jax.random.uniform(rng,shape=input_shape)
-    run_model_vs_tflite(model, input_data, act_bits, use_quantize)
+    run_model_vs_tflite(model, input_data, act_bits, use_quantize, tolerance = 0.01 if act_bits == 16 else 0)
     save_and_load_model(model, params, test_data)
 

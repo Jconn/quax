@@ -112,27 +112,34 @@ def default_16bit_calibrator(qx, x):
     return min_max_calibrator(qx, x, use_zp = False)
 
 def min_max_calibrator(qx, x, use_zp = False):
-    max_val = jnp.max(x, axis=qx.calibration_axes, keepdims=True)
-    min_val = jnp.min(x, axis=qx.calibration_axes, keepdims=True)
-    mid_point = (max_val + min_val)/2
-    if use_zp:
-        x = x - mid_point
-    abs_max = jnp.max(jnp.abs(x), axis=qx.calibration_axes, keepdims=True)
-
-    bound = abs_max
-    bound = jnp.where(bound == 0.0, jnp.ones_like(bound), bound)
-    scale = bound / qx.qx_numerics.get_quant_bound()
-
-    scale = ceil_to_po2(scale) if qx.po2_scaling else scale
-    #TODO - zp 
-    if use_zp:
-        zp = mid_point / scale
-        zp = zp.astype(jnp.int8)
-    else:
+    if not use_zp:
+        abs_max = jnp.max(jnp.abs(x), axis=qx.calibration_axes, keepdims=True)
+        scale = abs_max / qx.qx_numerics.get_quant_bound()
         zp = jnp.zeros(scale.shape)
-    scale = jnp.squeeze(scale)
-    zp = jnp.squeeze(zp)
-    return scale, -zp 
+    else:
+        max_val = jnp.max(x, axis=qx.calibration_axes, keepdims=True)
+        min_val = jnp.min(x, axis=qx.calibration_axes, keepdims=True)
+        qmin = qx.qx_numerics._get_bwd_clip_bound() 
+        qmax = qx.qx_numerics._get_fwd_clip_bound() 
+
+        avg = (max_val + min_val)/2.0
+        #TODO - likely messing up scaling
+        centered_max = jnp.max(jnp.abs(x - avg), axis=qx.calibration_axes, keepdims=True)
+        abs_max = jnp.max(jnp.abs(x), axis=qx.calibration_axes, keepdims=True)
+        scale_range = jnp.where(jnp.abs(avg) > centered_max, jnp.abs(avg), centered_max)
+        scale = scale_range / qx.qx_numerics.get_quant_bound()
+        #TODO - rounding of scale - trying to achieve tflite parity seems to encounter trouble around scale 
+        #scale = jnp.round(scale, decimals=12)
+        s_protected = jnp.where(scale == 0, jnp.ones_like(scale), scale)
+        zp = jnp.round(avg / s_protected)
+        zp = jnp.clip(zp, qmin, qmax) 
+        #import pdb; pdb.set_trace()
+        zp = -zp
+        zp = jnp.squeeze(zp)
+
+    scale = jnp.where(scale == 0.0, jnp.ones_like(scale), scale)
+    scale = ceil_to_po2(scale) if qx.po2_scaling else scale
+    return scale, zp 
 
 
 def calibrator_from_bits(bits):

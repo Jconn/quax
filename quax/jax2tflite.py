@@ -122,7 +122,7 @@ class FBB:
         self.handlers[Operation.SLICE] = self.slice_handler
         self.handlers[Operation.ADD] = self.vector_operator_handler
         self.handlers[Operation.SUB] = self.vector_operator_handler
-        self.handlers[Operation.MUL] = self.mul_handler
+        self.handlers[Operation.MUL] = self.vector_operator_handler
         self.handlers[Operation.CONCATENATE] = self.concat_handler
 
     def process_quax_op(self, op, quaxbegin, quaxend):
@@ -300,18 +300,6 @@ class FBB:
         op = tflu.add_concat_layer(in_tensors,out_tensor, axis, all_tensors=self.model.subgraphs[0].tensors, all_opcodes=self.model.operatorCodes) 
         self.record_op(op)
 
-    def mul_handler(self, quaxbegin, quaxend):
-        out_qxt = self.get_quaxtensor(quaxbegin, quaxbegin.params['quax_pytree']['op_name'])
-        out_tensor = self.make_empty_tensor(out_qxt, quaxend.invars[0]) 
-        in_tensors = [self.tensor_act_map[str(x)] for x in quaxbegin.invars]
-        out_var = quaxend.invars[0]
-
-        self.record_activation(out_var, out_tensor)
-
-        op = add_mul_layer(in_tensors[0], in_tensors[1], out_tensor, self.model.subgraphs[0].tensors, self.model.operatorCodes) 
-        self.record_op(op)
-        
-
     def slice_handler(self, quaxbegin, quaxend):
         slice_key = quaxend.params['quax_pytree']['slice_key']
         invar = quaxbegin.invars[0]
@@ -399,9 +387,10 @@ class FBB:
         else:
             raise Exception(f"couldn't find activation tensor with key {act_key}")
         if has_bias:
+            dequant_bias_weight = bias_qxt.dequant(bias_qxt.x)
             corrected_bias_qxt  = correct_bias_scale(in_qxt, weight_qxt, bias_qxt)
             #TODO - no zero point in bias
-            corrected_bias_qweight = np.array((corrected_bias_qxt.x/corrected_bias_qxt.scale), dtype=bias_dtype)
+            corrected_bias_qweight = np.array((dequant_bias_weight/corrected_bias_qxt.scale), dtype=bias_dtype)
 
             bias_qparams = make_quant_params(corrected_bias_qxt)
             bias_tensor = add_tensor("bias", corrected_bias_qweight, self.model.buffers, quantization_params = bias_qparams, dtype = bias_dtype)
@@ -470,9 +459,11 @@ class FBB:
         self.record_weight(weight_tensor)
         
         if has_bias:
+            dequant_bias_weight = bias_qxt.dequant(bias_qxt.x)
             corrected_bias_qxt  = correct_bias_scale(in_qxt, weight_qxt, bias_qxt)
             #TODO - no zero point in bias
-            corrected_bias_qweight = np.array((corrected_bias_qxt.x/corrected_bias_qxt.scale), dtype=bias_dtype)
+            corrected_bias_qweight = np.array((dequant_bias_weight/corrected_bias_qxt.scale), dtype=bias_dtype)
+            #import pdb; pdb.set_trace()
 
             bias_qparams = make_quant_params(corrected_bias_qxt)
             bias_tensor = add_tensor("bias", corrected_bias_qweight, self.model.buffers, quantization_params = bias_qparams, dtype = bias_dtype)

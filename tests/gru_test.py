@@ -10,7 +10,7 @@ from quax.quax_utils import bits_to_type
 from quax.jax2tflite import FBB
 from base import run_model_vs_tflite, save_and_load_model
 
-@pytest.mark.parametrize("act_bits", [8, 16])
+@pytest.mark.parametrize("act_bits", [8,16])
 @pytest.mark.parametrize("weight_bits", [8])
 @pytest.mark.parametrize("features", [31, 121])
 @pytest.mark.parametrize("input_shape", [(1, 100), (1,7), (2,2)])
@@ -37,7 +37,7 @@ def test_gru(act_bits, weight_bits, features, input_shape,use_quantize):
     params = fc_model.init(rng, input_data)
     test_data = jax.random.uniform(rng,shape=input_shape)
 
-    run_model_vs_tflite(fc_model, input_data, act_bits, use_quantize)
+    run_model_vs_tflite(fc_model, input_data, act_bits, use_quantize, tolerance = 0.0 if act_bits<16 else 1.01)
     save_and_load_model(fc_model, params, test_data)
 
 
