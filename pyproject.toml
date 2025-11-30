@@ -15,15 +15,35 @@ requires-python = ">=3.8"
 
 
 dependencies = [
-    "absl-py",
     "jax",
     "flax",
-    "tensorflow",
-    "tensorflow-datasets",
-    "optax",
     "numpy",
-    "quax",
-    "dataclasses"
+    "aqtp",
+    "flatbuffers"
+]
+
+# Optional dependencies for different use cases
+# Install with: pip install -e ".[test]" or pip install -e ".[e2e]"
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "tensorflow",
+    "orbax-checkpoint"
+]
+e2e = [
+    "tensorflow",
+    "orbax-checkpoint",
+    "absl-py",
+    "optax",
+    "tensorflow-datasets"
+]
+dev = [
+    "pytest",
+    "tensorflow",
+    "orbax-checkpoint",
+    "absl-py",
+    "optax",
+    "tensorflow-datasets"
 ]
 [tool.setuptools]
 packages = ["quax"]
