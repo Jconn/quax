@@ -43,69 +43,8 @@ from flax.typing import (
 )
 
 import copy
-
-
 import math
 
-INT32_MIN = -2**31
-INT32_MAX =  2**31 - 1
-
-def saturate_int32(x: int) -> int:
-    return INT32_MIN if x < INT32_MIN else INT32_MAX if x > INT32_MAX else x
-
-def rounding_divide_by_pot(x: int, exponent: int) -> int:
-    """Signed RoundingDivideByPOT with round-half-away-from-zero (TFLite)."""
-    assert exponent >= 0
-    mask = (1 << exponent) - 1
-    if x >= 0:
-        base = x >> exponent
-        remainder = x & mask
-        threshold = 1 << (exponent - 1) if exponent > 0 else 0
-        # ties (== threshold) go away from zero via LSB of base
-        return base + (1 if (remainder > threshold or
-                             (exponent > 0 and remainder == threshold and (base & 1))) else 0)
-    else:
-        # symmetric for negatives
-        return -rounding_divide_by_pot(-x, exponent)
-
-def quantize_multiplier_smaller_than_one(real_multiplier: float):
-    """Return (q, right_shift) s.t. real_multiplier ~= q / 2^(31+right_shift), q in [0,2^31)."""
-    assert 0.0 < real_multiplier < 1.0
-    shift = 0
-    m = real_multiplier
-    while m < 0.5:
-        m *= 2.0
-        shift += 1
-    q = int(round(m * (1 << 31)))
-    if q == (1 << 31):  # edge case
-        q //= 2
-        shift -= 1
-    return q, shift
-
-def quantize_multiplier_greater_than_one(real_multiplier: float):
-    """Return (q, left_shift) s.t. real_multiplier ~= (q * 2^left_shift) / 2^31."""
-    assert real_multiplier >= 1.0
-    m, e = math.frexp(real_multiplier)  # real = m * 2^e, m in [0.5,1)
-    q = int(round(m * (1 << 31)))
-    if q == (1 << 31):
-        q //= 2
-        e += 1
-    left_shift = e  # may be >= 1
-    return q, left_shift
-
-def multiply_by_quantized_multiplier(x: int, real_multiplier: float) -> int:
-    """Integer requantize: x * real_multiplier, with TFLite fixed-point rounding."""
-    if real_multiplier < 1.0:
-        q, rshift = quantize_multiplier_smaller_than_one(real_multiplier)
-        prod = int(x) * int(q)                  # 64-bit in Python
-        y = rounding_divide_by_pot(prod, 31 + rshift)
-        return saturate_int32(y)
-    else:
-        q, lshift = quantize_multiplier_greater_than_one(real_multiplier)
-        prod = int(x) * int(q)
-        y = rounding_divide_by_pot(prod, 31)    # back to int domain
-        y = saturate_int32(y << lshift)         # multiply by 2^left_shift (no rounding needed)
-        return y
 def get_default_numerics(bits, clip, clip_gradient, is_activation):
     return tflite_numerics.IntAsymmetric(bits=bits, clip=clip, clip_gradient=clip_gradient, is_activation=is_activation)
 
@@ -409,34 +348,15 @@ def unwrapped(x):
 def inherit_quaxtensor(qx):
     return copy.deepcopy(qx)
 
-@jax.custom_vjp
-def _neutral_rescale(x, full_scale):
-    # forward: identical numerics you already need
-    return x * full_scale
-
-def _neutral_rescale_fwd(x, full_scale):
-    y = x * full_scale
-    # stash a stop-grad copy so we can zeros_like it in bwd
-    return y, (jax.lax.stop_gradient(full_scale),)
 
 def accumulator_rescale(x, scale, prev_scalars = None):
     scale = jnp.where(scale == 0, jnp.ones_like(scale), scale)
-    #if prev_scalars != None:
-    #    x = prev_scalars 
-    #    x = tflite_round(x)
-    #    scale = prev_scalars/scale
-    #    m, shift = jnp.frexp(scale)
-    #    qvalue = (tflite_round(x * m )) * (2.0**shift)
-    #    qvalue = tflite_round(qvalue)
     if prev_scalars != None:
         full_scale = prev_scalars/scale
-        #qvalue = tflite_round(x * full_scale)
         qvalue = x * full_scale
     else:
-        #qvalue = tflite_round(x/scale)
         qvalue = x/scale
     return qvalue
-#CalibratorFn = Callable[[Any, jnp.ndarray], jnp.ndarray, jnp.ndarray]
 
 @aqt_utils.flax_slots_kw_only_dataclass
 class QuaxTensor:
