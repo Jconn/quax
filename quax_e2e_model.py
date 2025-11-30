@@ -107,13 +107,8 @@ def apply_model(model_params, images, labels, apply_fn):
     return loss, (logits, updated_var)
   grad_fn = jax.value_and_grad(loss_fn, has_aux=True, allow_int=True)
   aux, grads = grad_fn(model_params)
-  max_grad = grads['params']['QDense_0']['kernel'].max()
-  #vals = [jnp.abs(grads['params'][f'QDense_{i}']['kernel']).mean() for i in range(3)]
-  #print(vals)
   loss, (logits, updated_var) = aux
   accuracy = jnp.mean(jnp.argmax(logits, -1) == labels)
-  if max_grad > 4:
-      print(f"max grad {max_grad}")
   return grads, loss, accuracy, updated_var
 
 
@@ -155,8 +150,6 @@ def train_epoch(state, train_ds, batch_size, rng):
     state = update_model(state, grads, updated_var)
     epoch_loss.append(loss)
     epoch_accuracy.append(accuracy)
-    #jc - test early exit
-    #break
 
   train_loss = np.mean(epoch_loss)
   train_accuracy = np.mean(epoch_accuracy)
