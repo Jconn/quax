@@ -58,14 +58,15 @@ class CNN(QModule):
         ##x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
         #x = Dequantize()(x)
         #return x, x 
-        x = QConv(features=8, strides=(1,2), kernel_size=(1,3), lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = True, padding='SAME')(x)
+        x = QConv(features=8, strides=(1,1), kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn=nn.relu, use_bias = True, padding='VALID')(x)
         x = QConv(features=16, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+        x = QConv(features=4, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
         #x = QConv(features=32, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
         #x = x[...,:8]
         x = x.reshape((x.shape[0], -1))
-        x = QDense(features=400,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
+        x = QDense(features=128,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
         #x = QDense(features=200,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
-        x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
+        x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = None)(x)
         #x = out_x + rec_x
         pre_x = x
         x = Dequantize()(x)
