@@ -7,10 +7,10 @@ import flax
 
 
 class Operation(Enum):
-    UNKNOWN = 0 
+    UNKNOWN = 0
     FC = 1
     QUANTIZE = 2
-    CONV = 3 
+    CONV = 3
     TANH = 4
     ACTIVATION = 5
     RESHAPE = 6
@@ -21,6 +21,7 @@ class Operation(Enum):
     DEQUANTIZE = 11
     SUB = 12
     TRANSPOSE = 13
+    DEPTHWISE_CONV = 14
 
 class ActivationType(Enum):
     SIGMOID = 0

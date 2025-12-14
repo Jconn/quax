@@ -29,7 +29,7 @@ from jax.experimental import jax2tf
 import tensorflow as tf
 
 from quax.jax2tflite import FBB
-from quax.quax import QDense, Quantize, QConv, Dequantize, GRUCell
+from quax.quax import QDense, Quantize, QConv, QDepthwiseConv, Dequantize, GRUCell
 from quax import quax
 from quax.quax import QModule
 import orbax.checkpoint as ocp
@@ -59,34 +59,30 @@ class CNN(QModule):
         #x = Dequantize()(x)
         #return x, x 
         x = QConv(features=8, strides=(1,1), kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn=nn.relu, use_bias = True, padding='VALID')(x)
-        x = QConv(features=16, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+        x = QDepthwiseConv(kernel_size=(3,3),
+                           channel_multiplier=1,
+                           strides=(1,1),
+                           lhs_bits=act_bits,
+                           rhs_bits=weight_bits,
+                           use_bias=True,
+                           padding='SAME',
+                           act_fn=None)(x)
+        x = QConv(features=16, kernel_size=(1,1), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
+        x = QDepthwiseConv(kernel_size=(3,3),
+                           channel_multiplier=1,
+                           strides=(1,1),
+                           lhs_bits=act_bits,
+                           rhs_bits=weight_bits,
+                           use_bias=True,
+                           padding='SAME',
+                           act_fn=None)(x)
         x = QConv(features=4, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
-        #x = QConv(features=32, kernel_size=(3,3), lhs_bits = act_bits, rhs_bits = weight_bits, act_fn = nn.relu, use_bias = True, padding='VALID')(x)
-        #x = x[...,:8]
         x = x.reshape((x.shape[0], -1))
         x = QDense(features=128,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
-        #x = QDense(features=200,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = nn.relu)(x)
         x = QDense(features=10,lhs_bits = act_bits, rhs_bits = weight_bits, use_bias = bias, act_fn = None)(x)
-        #x = out_x + rec_x
         pre_x = x
         x = Dequantize()(x)
         return x, pre_x 
-#current
-#epoch:  1, train_loss: 1.787965178489685058593750000000, train_accuracy: 88.049209594726562500000000000000, test_loss: 0.000000000000000000000000000000, test_accuracy: 0.000000000000000000000000000000
-#epoch:  2, train_loss: 0.365248560905456542968750000000, train_accuracy: 94.808357238769531250000000000000, test_loss: 0.000000000000000000000000000000, test_accuracy: 0.000000000000000000000000000000
-#epoch:  3, train_loss: 0.187788516283035278320312500000, train_accuracy: 96.606239318847656250000000000000, test_loss: 0.000000000000000000000000000000, test_accuracy: 0.000000000000000000000000000000
-#saved orbax ckpt
-#get_datasets started
-#get_datasets DONE
-#INFO: Created TensorFlow Lite XNNPACK delegate for CPU.
-#tflite jax PASS - tfl; 0.20701371133327484, jax - 0.20930227637290955
-#python3 quax_e2e_model.py  303.27s user 10.49s system 220% cpu 2:22.52 total
-
-#past
-#epoch:  1, train_loss: 0.181281909346580505371093750000, train_accuracy: 94.422744750976562500000000000000, test_loss: 0.000000000000000000000000000000, test_accuracy: 0.000000000000000000000000000000
-#epoch:  2, train_loss: 0.046388112008571624755859375000, train_accuracy: 98.559364318847656250000000000000, test_loss: 0.000000000000000000000000000000, test_accuracy: 0.000000000000000000000000000000
-#epoch:  3, train_loss: 0.025830011814832687377929687500, train_accuracy: 99.192039489746093750000000000000, test_loss: 0.000000000000000000000000000000, test_accuracy: 0.000000000000000000000000000000
-#python3 quax_e2e_model.py  213.90s user 8.84s system 1004% cpu 22.168 total
 
 @functools.partial(jax.jit, static_argnums=(3,))
 def apply_model(model_params, images, labels, apply_fn):

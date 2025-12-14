@@ -6,11 +6,12 @@ from quax.schema_py_generated import (Model, ModelT, SubGraph, SubGraphT, Tensor
                                         BuiltinOptions, FullyConnectedOptions, FullyConnectedOptionsT,
                                         ActivationFunctionType, SignatureDef, SignatureDefT, TensorMap, TensorMapT)
 
-from quax.tflite_utils import (get_empty_buffer, add_buffer, add_tensor, 
+from quax.tflite_utils import (get_empty_buffer, add_buffer, add_tensor,
                             add_empty_tensor, add_tensor_with_buffer, add_fc_layer, add_conv_layer,
                                 add_vec_layer,add_mul_layer, create_subgraph, create_model,create_signature_def,
                                export_tflite, create_runtime_metadata,create_conversion_metadata, add_reshape_layer, add_slice_layer, add_strided_slice_layer, add_relu_layer,add_activation_layer,
                                add_quantization_params, add_quant_layer, add_dequant_layer,add_transpose_layer,
+                               add_depthwise_conv_layer,
                                create_runtime_metadata_obj, create_conversion_metadata_obj)
 import quax.tflite_utils as tflite_utils
 import quax.tflite_utils as tflu 
@@ -43,7 +44,7 @@ def correct_bias_scale(in_qxt, weight_qxt, bias_qxt):
 def quantized_weights(qx):
     return qx.quantized_tensor()
 
-def make_quant_params(qxt):
+def make_quant_params(qxt, quantized_dim=0):
     def match_dims(a, b):
         if a.shape == ():
             return jnp.reshape(jnp.asarray(a), (1,) * b.ndim)
@@ -51,18 +52,20 @@ def make_quant_params(qxt):
 
     weight_scale = qxt.scale
     weight_zero_point = qxt.zero_point
-    dequantized_weights = qxt.x 
+    dequantized_weights = qxt.x
     weight_zero_point = match_dims(weight_zero_point, dequantized_weights)
     weight_scale = match_dims(weight_scale, dequantized_weights)
 
     target_shape = weight_scale.shape
-    reduce_axes = tuple(i for i, (d1, d2) in enumerate(zip(dequantized_weights.shape, target_shape)) if d1 != d2)
+
+    # Reduce over all axes except quantized_dim for per-channel quantization
+    reduce_axes = tuple(i for i in range(dequantized_weights.ndim) if i != quantized_dim)
     weight_mins = jnp.min(dequantized_weights, axis=reduce_axes, keepdims=True)
     weight_maxs = jnp.max(dequantized_weights, axis=reduce_axes, keepdims=True)
 
     #need to find the algorithm that matches the mins to the scales
     #TODO - weight zp is always zero
-    weight_qparams = add_quantization_params(weight_mins, weight_maxs, weight_scale, weight_zero_point, quantized_dim = 0)
+    weight_qparams = add_quantization_params(weight_mins, weight_maxs, weight_scale, weight_zero_point, quantized_dim=quantized_dim)
     return weight_qparams
         
 
@@ -116,6 +119,7 @@ class FBB:
         self.handlers[Operation.QUANTIZE] = self.quant_handler
         self.handlers[Operation.DEQUANTIZE] = self.dequant_handler
         self.handlers[Operation.CONV] = self.conv_handler
+        self.handlers[Operation.DEPTHWISE_CONV] = self.depthwise_conv_handler
         self.handlers[Operation.ACTIVATION] = self.activation_handler
         self.handlers[Operation.RESHAPE] = self.reshape_handler
         self.handlers[Operation.TRANSPOSE] = self.transpose_handler
@@ -403,10 +407,77 @@ class FBB:
         #self.record_weight(bias_var, bias_tensor)
         #self.record_weight(weight_var, weight_tensor)
         # Temporarily create a builder just for the layer creation
-        op = add_conv_layer(input_tensor=activation_tensor, weight_tensor=weight_tensor,bias_tensor=bias_tensor,output_tensor=out_tensor, bias_dtype = bias_dtype, activation_op=activation_op, all_tensors=self.model.subgraphs[0].tensors, all_opcodes=self.model.operatorCodes, quax_params=quaxend.params['quax_pytree']) 
+        op = add_conv_layer(input_tensor=activation_tensor, weight_tensor=weight_tensor,bias_tensor=bias_tensor,output_tensor=out_tensor, bias_dtype = bias_dtype, activation_op=activation_op, all_tensors=self.model.subgraphs[0].tensors, all_opcodes=self.model.operatorCodes, quax_params=quaxend.params['quax_pytree'])
         self.record_op(op)
 
-    
+    def depthwise_conv_handler(self, quaxbegin, quaxend):
+
+        in_qxt = self.get_quaxtensor(quaxend, 'input')
+        out_qxt = self.get_quaxtensor(quaxend, 'output')
+        weight_qxt = self.get_quaxtensor(quaxend, 'kernel')
+        has_bias = True
+
+        bias_qxt = self.get_quaxtensor(quaxend, 'bias')
+        if bias_qxt == None:
+            has_bias = False
+            bias_tensor = None
+
+        in_var = quaxbegin.invars[0]
+        out_var = quaxend.invars[0]
+
+        out_dtype = bits_to_type(out_qxt.bits)
+        weight_dtype = bits_to_type(weight_qxt.bits)
+        bias_dtype = bits_to_type(weight_qxt.bits + out_qxt.bits + 16)
+
+        weight = weight_qxt.quantized_tensor()
+        weight = weight.astype(weight_dtype)
+        strides = quaxend.params['quax_pytree']['window_strides']
+        lhs_dilation = quaxend.params['quax_pytree']['lhs_dilation']
+        rhs_dilation = quaxend.params['quax_pytree']['rhs_dilation']
+        padding = quaxend.params['quax_pytree']
+
+        # For depthwise conv, weight shape is (KH, KW, 1, IC * channel_multiplier)
+        # TFLite expects (1, KH, KW, IC * channel_multiplier)
+        # So we just transpose to move first dimension last
+        kh, kw, _, total_channels = weight.shape
+        weight = jnp.transpose(weight, (2, 0, 1, 3))  # (1, KH, KW, IC*CM)
+
+        # Create quantization params with quantized_dim=3 (last dimension after transpose)
+        weight_qparams = make_quant_params(weight_qxt, quantized_dim=3)
+
+        weight_tensor = add_tensor("weight", weight, self.model.buffers, quantization_params = weight_qparams, dtype = weight_dtype)
+        self.record_weight(weight_tensor)
+
+        act_key = str(in_var)
+        if act_key in self.tensor_act_map.keys():
+            activation_tensor = self.tensor_act_map[act_key]
+        else:
+            raise Exception(f"couldn't find activation tensor with key {act_key}")
+
+        if has_bias:
+            dequant_bias_weight = bias_qxt.dequant(bias_qxt.x)
+            corrected_bias_qxt = correct_bias_scale(in_qxt, weight_qxt, bias_qxt)
+            corrected_bias_qweight = np.array((dequant_bias_weight/corrected_bias_qxt.scale), dtype=bias_dtype)
+
+            bias_qparams = make_quant_params(corrected_bias_qxt)
+            bias_tensor = add_tensor("bias", corrected_bias_qweight, self.model.buffers, quantization_params = bias_qparams, dtype = bias_dtype)
+            self.record_weight(bias_tensor)
+
+        out_tensor = self.make_empty_tensor(out_qxt, out_var)
+        activation_op = tflite_utils.map_appended_activation(quaxend.params['quax_pytree']['act_fn'])
+
+        # Calculate depth multiplier: total_channels / in_features
+        in_features = in_var.aval.shape[-1]
+        depth_multiplier = total_channels // in_features
+
+        # Add depth_multiplier to quax_params for TFLite conversion
+        quax_params_copy = dict(quaxend.params['quax_pytree'])
+        quax_params_copy['depth_multiplier'] = depth_multiplier
+
+        op = add_depthwise_conv_layer(input_tensor=activation_tensor, weight_tensor=weight_tensor, bias_tensor=bias_tensor, output_tensor=out_tensor, bias_dtype=bias_dtype, activation_op=activation_op, all_tensors=self.model.subgraphs[0].tensors, all_opcodes=self.model.operatorCodes, quax_params=quax_params_copy)
+        self.record_op(op)
+
+
     def fc_handler(self, quaxbegin, quaxend):
         '''
         structure of fc ops should be

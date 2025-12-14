@@ -3,13 +3,14 @@ import numpy as np
 # Using the new flatbuffer schema generated with object API
 from quax.schema_py_generated import (
     Model, ModelT, SubGraph, SubGraphT, Tensor, TensorT, OperatorCode, OperatorCodeT,
-    Buffer, BufferT, Operator, OperatorT, BuiltinOperator, 
+    Buffer, BufferT, Operator, OperatorT, BuiltinOperator,
     BuiltinOptions, FullyConnectedOptions, FullyConnectedOptionsT, ConcatenationOptions, ConcatenationOptionsT,
     ActivationFunctionType, AddOptions, AddOptionsT, MulOptions, MulOptionsT, TensorMap, TensorMapT,
-    SignatureDef, SignatureDefT, Metadata, MetadataT, QuantizationParameters, QuantizationParametersT, 
-    ReshapeOptions, ReshapeOptionsT, TensorType, Conv2DOptions, Conv2DOptionsT, Padding, 
-    QuantizeOptions, QuantizeOptionsT, StridedSliceOptions, StridedSliceOptionsT, 
-    SliceOptions, SliceOptionsT, DequantizeOptions, DequantizeOptionsT
+    SignatureDef, SignatureDefT, Metadata, MetadataT, QuantizationParameters, QuantizationParametersT,
+    ReshapeOptions, ReshapeOptionsT, TensorType, Conv2DOptions, Conv2DOptionsT, Padding,
+    QuantizeOptions, QuantizeOptionsT, StridedSliceOptions, StridedSliceOptionsT,
+    SliceOptions, SliceOptionsT, DequantizeOptions, DequantizeOptionsT,
+    DepthwiseConv2DOptions, DepthwiseConv2DOptionsT
 )
 
 from enum import Enum
@@ -422,6 +423,41 @@ def add_conv_layer(input_tensor, weight_tensor, bias_tensor, output_tensor,bias_
 
     conv_op = add_operator(conv_inputs, conv_outputs, conv_options, BuiltinOptions.Conv2DOptions, conv_opcode, all_opcodes)
     return conv_op
+
+def add_depthwise_conv_layer(input_tensor, weight_tensor, bias_tensor, output_tensor, bias_dtype, activation_op, all_tensors, all_opcodes, quax_params):
+
+    dw_conv_options = DepthwiseConv2DOptionsT()
+
+    dw_conv_options.strideH = quax_params['window_strides'][0]
+    dw_conv_options.strideW = quax_params['window_strides'][1]
+
+    dw_conv_options.dilationHFactor = quax_params['rhs_dilation'][0]
+    dw_conv_options.dilationWFactor = quax_params['rhs_dilation'][1]
+
+    dw_conv_options.fusedActivationFunction = activation_op
+
+    if quax_params['padding'] == 'SAME':
+        padding = Padding.SAME
+    else:
+        padding = Padding.VALID
+    dw_conv_options.padding = padding
+
+    # Depthwise multiplier from quax_params
+    dw_conv_options.depthMultiplier = quax_params.get('depth_multiplier', 1)
+
+    dw_conv_opcode = OperatorCodeT()
+    dw_conv_opcode.builtinCode = BuiltinOperator.DEPTHWISE_CONV_2D
+
+    if bias_tensor:
+        input_list = [input_tensor, weight_tensor, bias_tensor]
+    else:
+        input_list = [input_tensor, weight_tensor]
+    dw_conv_inputs = [all_tensors.index(tensor) for tensor in input_list]
+
+    dw_conv_outputs = [all_tensors.index(output_tensor)]
+
+    dw_conv_op = add_operator(dw_conv_inputs, dw_conv_outputs, dw_conv_options, BuiltinOptions.DepthwiseConv2DOptions, dw_conv_opcode, all_opcodes)
+    return dw_conv_op
 
 def add_activation_layer(input_tensor, output_tensor, operator_type, all_tensors, all_opcodes):
     # Create OperatorCodeT object using object API

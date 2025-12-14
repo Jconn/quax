@@ -123,13 +123,10 @@ def min_max_calibrator(qx, x, use_zp = False):
         qmax = qx.qx_numerics._get_fwd_clip_bound() 
 
         avg = (max_val + min_val)/2.0
-        #TODO - likely messing up scaling
         centered_max = jnp.max(jnp.abs(x - avg), axis=qx.calibration_axes, keepdims=True)
         abs_max = jnp.max(jnp.abs(x), axis=qx.calibration_axes, keepdims=True)
         scale_range = jnp.where(jnp.abs(avg) > centered_max, jnp.abs(avg), centered_max)
         scale = scale_range / qx.qx_numerics.get_quant_bound()
-        #TODO - rounding of scale - trying to achieve tflite parity seems to encounter trouble around scale 
-        #scale = jnp.round(scale, decimals=12)
         s_protected = jnp.where(scale == 0, jnp.ones_like(scale), scale)
         zp = jnp.round(avg / s_protected)
         zp = jnp.clip(zp, qmin, qmax) 

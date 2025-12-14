@@ -1256,3 +1256,181 @@ class QConv(QModule):
 
     quaxpr_default(qy, self.op_type,self, lhs_dilation=input_dilation, rhs_dilation=kernel_dilation,window_strides=strides, padding = self.padding, act_fn = map_appended_activation(self.act_fn))
     return qy
+
+class QDepthwiseConv(QModule):
+  """Depthwise Convolution Module.
+
+  Performs depthwise separable convolution where each input channel is convolved
+  separately with its own set of filters.
+
+  Attributes:
+    kernel_size: shape of the convolutional kernel. An integer will be
+      interpreted as a tuple of the single integer.
+    channel_multiplier: number of output channels per input channel (default: 1).
+    strides: an integer or a sequence of `n` integers, representing the
+      inter-window strides (default: 1).
+    padding: either the string 'SAME', the string 'VALID', or a sequence of
+      n (low, high) integer pairs that give the padding to apply before and
+      after each spatial dimension.
+    input_dilation: an integer or a sequence of n integers, giving the
+      dilation factor to apply in each spatial dimension of inputs (default: 1).
+    kernel_dilation: an integer or a sequence of n integers, giving the
+      dilation factor to apply in each spatial dimension of the convolution
+      kernel (default: 1).
+    use_bias: whether to add a bias to the output (default: True).
+    dtype: the dtype of the computation (default: infer from input and params).
+    param_dtype: the dtype passed to parameter initializers (default: float32).
+    precision: numerical precision of the computation see jax.lax.Precision.
+    kernel_init: initializer for the convolutional kernel.
+    bias_init: initializer for the bias.
+    act_fn: optional activation function to fuse with the convolution.
+  """
+
+  kernel_size: int | Sequence[int]
+  lhs_bits: int
+  rhs_bits: int
+  channel_multiplier: int = 1
+  strides: None | int | Sequence[int] = 1
+  padding: PaddingLike = 'SAME'
+  input_dilation: None | int | Sequence[int] = 1
+  kernel_dilation: None | int | Sequence[int] = 1
+  use_bias: bool = True
+  dtype: Dtype | None = None
+  param_dtype: Dtype = jnp.float32
+  precision: PrecisionLike = None
+  kernel_init: Initializer = default_kernel_init
+  bias_init: Initializer = initializers.zeros_init()
+  act_fn: nn.activation = None
+  op_type: Operation = Operation.DEPTHWISE_CONV
+
+  @nn.compact
+  def __call__(self, x: Array) -> Array:
+    """Applies a depthwise convolution to the inputs.
+
+    Args:
+      x: input data with dimensions (*batch_dims, spatial_dims..., features).
+        This is the channels-last convention, i.e. NHWC for a 2d convolution.
+
+    Returns:
+      The convolved data with shape (*batch_dims, spatial_dims...,
+      features * channel_multiplier).
+    """
+    quaxpr_default(x, self.op_type, self)
+    allowed_acts = [nn.relu, nn.relu6, None]
+    assert self.act_fn in allowed_acts, f"can't fuse act fn {self.act_fn}"
+
+    kernel_size: Sequence[int]
+    if isinstance(self.kernel_size, int):
+      kernel_size = (self.kernel_size,)
+    else:
+      kernel_size = tuple(self.kernel_size)
+
+    def maybe_broadcast(
+      x: int | Sequence[int] | None,
+    ) -> tuple[int, ...]:
+      if x is None:
+        x = 1
+      if isinstance(x, int):
+        return (x,) * len(kernel_size)
+      return tuple(x)
+
+    strides = maybe_broadcast(self.strides)
+    input_dilation = maybe_broadcast(self.input_dilation)
+    kernel_dilation = maybe_broadcast(self.kernel_dilation)
+
+    padding_lax = flax.linen.linear.canonicalize_padding(self.padding, len(kernel_size))
+    if padding_lax == 'CIRCULAR':
+      kernel_size_dilated = [
+        (k - 1) * d + 1 for k, d in zip(kernel_size, kernel_dilation)
+      ]
+      zero_pad: list[tuple[int, int]] = [(0, 0)]
+      pads = (
+        zero_pad
+        + [((k - 1) // 2, k // 2) for k in kernel_size_dilated]
+        + [(0, 0)]
+      )
+      x = jnp.pad(x, pads, mode='wrap')
+      padding_lax = 'VALID'
+    elif padding_lax == 'CAUSAL':
+      if len(kernel_size) != 1:
+        raise ValueError(
+          'Causal padding is only implemented for 1D convolutions.'
+        )
+      left_pad = kernel_dilation[0] * (kernel_size[0] - 1)
+      pads = [(0, 0), (left_pad, 0), (0, 0)]
+      x = jnp.pad(x, pads)
+      padding_lax = 'VALID'
+
+    dimension_numbers = flax.linen.linear._conv_dimension_numbers(x.shape)
+    in_features = jnp.shape(x)[-1]
+
+    # Depthwise convolution kernel shape: (KH, KW, 1, in_features * channel_multiplier)
+    # When feature_group_count = in_features, kernel input channels must be 1
+    kernel_shape = kernel_size + (1, in_features * self.channel_multiplier)
+
+    kernel = self.param(
+      'kernel', self.kernel_init, kernel_shape, self.param_dtype
+    )
+
+    kernel = quantize(kernel, self, 'kernel', is_activation=False,
+                     calibration_axes=[_ for _ in range(0, kernel.ndim-1)],
+                     bits=self.rhs_bits,
+                     calibrator=quantizer.AbsMaxCalibrator(use_zp=False),
+                     po2_scaling=False)
+
+    if self.use_bias:
+      bias_shape = (in_features * self.channel_multiplier,)
+      bias = self.param('bias', self.bias_init, bias_shape, self.param_dtype)
+      bias = quantize(bias, self, 'bias', is_activation=False,
+                     calibration_axes=[_ for _ in range(0, bias.ndim-1)],
+                     bits=16,
+                     calibrator=quantizer.AbsMaxCalibrator(use_zp=False),
+                     po2_scaling=False)
+    else:
+      bias = None
+
+    train_quant = self.get_tq()
+    if train_quant:
+      self.store_quantized('input', x, scale_only=True)
+    else:
+      if self.var_exists('input'):
+        stored_qx = self.get_quantized('input')
+        stored_scale = stored_qx.scale
+        stored_zp = stored_qx.zero_point
+      else:
+        stored_scale = 1.0
+        stored_zp = 0.0
+      x.replace(scale=stored_scale, zero_point=stored_zp)
+
+    # Depthwise convolution: feature_group_count = in_features
+    y = lax.conv_general_dilated(
+      x.x,
+      kernel.x,
+      strides,
+      padding_lax,
+      lhs_dilation=input_dilation,
+      rhs_dilation=kernel_dilation,
+      dimension_numbers=dimension_numbers,
+      feature_group_count=in_features,
+      precision=self.precision,
+    )
+
+    if self.use_bias:
+      float_bias = bias.dequant(bias.x)
+      float_bias *= 1.0 / (x.scale * kernel.scale)
+      y += jnp.reshape(float_bias, (1,) * (y.ndim - bias.ndim) + bias.shape)
+
+    qy = quantize(y, self, 'output', is_activation=True,
+                 calibration_axes=[_ for _ in range(0, y.ndim)],
+                 bits=self.lhs_bits,
+                 calibrator=quantizer.MovingAverageAbsMaxCalibrator(),
+                 po2_scaling=False,
+                 input_scalars=x.scale * kernel.scale)
+
+    if self.act_fn:
+      qy.x = self.act_fn(qy.x)
+
+    quaxpr_default(qy, self.op_type, self, lhs_dilation=input_dilation,
+                  rhs_dilation=kernel_dilation, window_strides=strides,
+                  padding=self.padding, act_fn=map_appended_activation(self.act_fn))
+    return qy
